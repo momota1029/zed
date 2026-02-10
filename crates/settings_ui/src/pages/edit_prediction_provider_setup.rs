@@ -1,13 +1,13 @@
+use codestral::{CODESTRAL_API_URL, codestral_api_key_state, codestral_api_url};
 use edit_prediction::{
-    ApiKeyState, MercuryFeatureFlag, SweepFeatureFlag,
+    ApiKeyState,
     mercury::{MERCURY_CREDENTIALS_URL, mercury_api_token},
     sweep_ai::{SWEEP_CREDENTIALS_URL, sweep_api_token},
 };
 use edit_prediction_ui::{get_available_providers, set_completion_provider};
-use feature_flags::FeatureFlagAppExt as _;
 use gpui::{Entity, ScrollHandle, prelude::*};
 use language::language_settings::AllLanguageSettings;
-use language_models::provider::mistral::{CODESTRAL_API_URL, codestral_api_key};
+
 use settings::Settings as _;
 use ui::{ButtonLink, ConfiguredApiCard, ContextMenu, DropdownMenu, DropdownStyle, prelude::*};
 use workspace::AppState;
@@ -29,7 +29,7 @@ pub(crate) fn render_edit_prediction_setup_page(
     let providers = [
         Some(render_provider_dropdown(window, cx)),
         render_github_copilot_provider(window, cx).map(IntoElement::into_any_element),
-        cx.has_flag::<MercuryFeatureFlag>().then(|| {
+        Some(
             render_api_key_provider(
                 IconName::Inception,
                 "Mercury",
@@ -40,9 +40,9 @@ pub(crate) fn render_edit_prediction_setup_page(
                 window,
                 cx,
             )
-            .into_any_element()
-        }),
-        cx.has_flag::<SweepFeatureFlag>().then(|| {
+            .into_any_element(),
+        ),
+        Some(
             render_api_key_provider(
                 IconName::SweepAi,
                 "Sweep",
@@ -62,16 +62,16 @@ pub(crate) fn render_edit_prediction_setup_page(
                 window,
                 cx,
             )
-            .into_any_element()
-        }),
+            .into_any_element(),
+        ),
         Some(render_ollama_provider(settings_window, window, cx).into_any_element()),
         Some(
             render_api_key_provider(
                 IconName::AiMistral,
                 "Codestral",
                 "https://console.mistral.ai/codestral".into(),
-                codestral_api_key(cx),
-                |cx| language_models::MistralLanguageModelProvider::api_url(cx),
+                codestral_api_key_state(cx),
+                |cx| codestral_api_url(cx),
                 Some(
                     settings_window
                         .render_sub_page_items_section(
@@ -135,11 +135,7 @@ fn render_provider_dropdown(window: &mut Window, cx: &mut App) -> AnyElement {
         .id("provider-selector")
         .min_w_0()
         .gap_1p5()
-        .child(
-            SettingsSectionHeader::new("Active Provider")
-                .icon(IconName::Sparkle)
-                .no_padding(true),
-        )
+        .child(SettingsSectionHeader::new("Active Provider").no_padding(true))
         .child(
             h_flex()
                 .pt_2p5()
@@ -158,6 +154,7 @@ fn render_provider_dropdown(window: &mut Window, cx: &mut App) -> AnyElement {
                 )
                 .child(
                     DropdownMenu::new("provider-dropdown", current_provider_name, menu)
+                        .tab_index(0)
                         .style(DropdownStyle::Outlined),
                 ),
         )
@@ -175,7 +172,7 @@ fn render_api_key_provider(
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
     let weak_page = cx.weak_entity();
-    _ = window.use_keyed_state(title, cx, |_, cx| {
+    _ = window.use_keyed_state(current_url(cx), cx, |_, cx| {
         let task = api_key_state.update(cx, |key_state, cx| {
             key_state.load_if_needed(current_url(cx), |state| state, cx)
         });
@@ -349,13 +346,8 @@ fn render_ollama_provider(
         .gap_1p5()
         .child(
             SettingsSectionHeader::new("Ollama")
-                .icon(IconName::ZedPredict)
+                .icon(IconName::AiOllama)
                 .no_padding(true),
-        )
-        .child(
-            Label::new("Configure the local Ollama server and model used for edit predictions.")
-                .size(LabelSize::Small)
-                .color(Color::Muted),
         )
         .child(div().px_neg_8().child(additional_fields))
 }
