@@ -1295,11 +1295,19 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
+                        for hitbox_id in &window.mouse_hit_test.ids {
+                            for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
+                                if hitbox.id == *hitbox_id {
+                                    return Some(*area);
+                                }
                             }
+
+                            // Topmost hovered hitbox is not a window control area.
+                            // Do not allow controls underneath (e.g. ancestor Drag area)
+                            // to capture this point as non-client.
+                            return None;
                         }
+
                         None
                     })
                     .log_err()
