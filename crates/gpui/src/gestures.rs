@@ -137,7 +137,10 @@ impl Default for GestureTuning {
             multi_tap_slop: px(16.),
             long_press_duration: Duration::from_millis(500),
             scroll_physics: ScrollPhysics::ios(),
-            min_fling_velocity: 50.,
+            // Touch panels can report a lower logical-pixel velocity than the
+            // physical finger speed on high-DPI displays. Keep gentle flicks
+            // from stopping abruptly while remaining above incidental drift.
+            min_fling_velocity: 25.,
         }
     }
 }
