@@ -468,11 +468,10 @@ const MOMENTUM_STOP_VELOCITY: f32 = 10.;
 const VELOCITY_WINDOW: Duration = Duration::from_millis(100);
 
 /// A pause between samples longer than this means the finger stopped:
-/// anything before the pause describes an earlier motion, not the release.
-/// Keep it aligned with `VELOCITY_WINDOW`: some touch drivers deliver the
-/// terminal event after the last movement sample, even when the finger was
-/// still moving at release.
-const VELOCITY_ASSUME_STOPPED_GAP: Duration = VELOCITY_WINDOW;
+/// anything before the pause describes an earlier motion, not the release
+/// (Flutter's `kAssumePointerMoveStoppedMilliseconds`). Touch hardware
+/// reports movement every 8–16ms while the finger is in motion.
+const VELOCITY_ASSUME_STOPPED_GAP: Duration = Duration::from_millis(40);
 
 const VELOCITY_MAX_SAMPLES: usize = 20;
 
@@ -1664,32 +1663,6 @@ mod tests {
             now + Duration::from_millis(600),
         );
         assert!(!recognizer.has_momentum());
-    }
-
-    #[test]
-    fn delayed_terminal_event_within_velocity_window_preserves_momentum() {
-        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
-        let now = Instant::now();
-        let touch = TouchId(1);
-
-        recognizer.handle_event_at(&touch_event(touch, TouchPhase::Started, 100., 300.), now);
-        recognizer.handle_event_at(
-            &touch_event(touch, TouchPhase::Moved, 100., 260.),
-            now + Duration::from_millis(16),
-        );
-        recognizer.handle_event_at(
-            &touch_event(touch, TouchPhase::Moved, 100., 220.),
-            now + Duration::from_millis(32),
-        );
-        // Some Windows touch drivers report the terminal event after a short
-        // quiet period, even for a flick. The recent movement still describes
-        // the release velocity.
-        recognizer.handle_event_at(
-            &touch_event(touch, TouchPhase::Ended, 100., 220.),
-            now + Duration::from_millis(96),
-        );
-
-        assert!(recognizer.has_momentum());
     }
 
     #[test]
