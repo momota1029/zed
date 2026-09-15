@@ -477,13 +477,6 @@ const VELOCITY_WINDOW: Duration = Duration::from_millis(100);
 /// still moving at release.
 const VELOCITY_ASSUME_STOPPED_GAP: Duration = VELOCITY_WINDOW;
 
-/// A completed pan should feel like direct manipulation rather than stop at
-/// an arbitrary sampling boundary. When a recent release has too little data
-/// for a reliable velocity estimate, continue in its last direction at this
-/// gentle fallback speed.
-const PAN_RELEASE_MOMENTUM_VELOCITY: f32 = 120.;
-const PAN_RELEASE_IDLE_GAP: Duration = Duration::from_millis(250);
-
 const VELOCITY_MAX_SAMPLES: usize = 20;
 
 /// The portable recognizer behind raw touch input: it watches the
@@ -782,11 +775,13 @@ impl TouchGestureRecognizer {
                     // estimate. But a release long after the last movement
                     // means the finger had already stopped, so nothing
                     // flings.
-                    let release_gap = touch
-                        .velocity_tracker
-                        .latest_sample_time()
-                        .map_or(Duration::MAX, |latest| now.duration_since(latest));
-                    let finger_stopped = release_gap > VELOCITY_ASSUME_STOPPED_GAP;
+                    let finger_stopped =
+                        touch
+                            .velocity_tracker
+                            .latest_sample_time()
+                            .is_none_or(|latest| {
+                                now.duration_since(latest) > VELOCITY_ASSUME_STOPPED_GAP
+                            });
                     let mut velocity = if finger_stopped {
                         Point::default()
                     } else {
@@ -796,22 +791,7 @@ impl TouchGestureRecognizer {
                         Axis::Vertical => velocity.x = 0.,
                         Axis::Horizontal => velocity.y = 0.,
                     }
-                    let mut speed = (velocity.x.powi(2) + velocity.y.powi(2)).sqrt();
-                    if speed < self.tuning.min_fling_velocity
-                        && release_gap <= PAN_RELEASE_IDLE_GAP
-                        && !touch.last_movement.is_zero()
-                    {
-                        let movement_length = touch.last_movement.magnitude() as f32;
-                        let direction = point(
-                            f32::from(touch.last_movement.x) / movement_length,
-                            f32::from(touch.last_movement.y) / movement_length,
-                        );
-                        velocity = point(
-                            direction.x * PAN_RELEASE_MOMENTUM_VELOCITY,
-                            direction.y * PAN_RELEASE_MOMENTUM_VELOCITY,
-                        );
-                        speed = PAN_RELEASE_MOMENTUM_VELOCITY;
-                    }
+                    let speed = (velocity.x.powi(2) + velocity.y.powi(2)).sqrt();
                     let mut release_delta = event.position - touch.emitted_position;
                     lock_delta_to_axis(&mut release_delta, axis);
                     if speed >= self.tuning.min_fling_velocity {
