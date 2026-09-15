@@ -543,7 +543,19 @@ struct ActiveTouch {
     /// Retained across stationary samples so prediction corrections cannot
     /// reverse a pan when integer browser coordinates repeat.
     last_movement: Point<Pixels>,
+    timestamp_origin: Option<(Duration, Instant)>,
     velocity_tracker: VelocityTracker,
+}
+
+impl ActiveTouch {
+    fn event_time(&self, timestamp: Option<Duration>, fallback: Instant) -> Instant {
+        match (self.timestamp_origin, timestamp) {
+            (Some((origin_timestamp, origin_time)), Some(timestamp)) => {
+                origin_time + timestamp.saturating_sub(origin_timestamp)
+            }
+            _ => fallback,
+        }
+    }
 }
 
 struct CompletedTap {
@@ -615,6 +627,7 @@ impl TouchGestureRecognizer {
                         last_position: event.position,
                         emitted_position: event.position,
                         last_movement: Point::default(),
+                        timestamp_origin: event.timestamp.map(|timestamp| (timestamp, now)),
                         velocity_tracker,
                     };
                     if let Some(axis) = caught_fling {
@@ -646,7 +659,9 @@ impl TouchGestureRecognizer {
                     long_press_offered,
                     touch_drag_offered,
                 } if touch.id == event.id => {
-                    touch.velocity_tracker.push(now, event.position);
+                    touch
+                        .velocity_tracker
+                        .push(touch.event_time(event.timestamp, now), event.position);
                     touch.last_position = event.position;
                     let accumulated = event.position - touch.start_position;
                     if accumulated.magnitude() > f64::from(self.tuning.touch_slop) {
@@ -686,7 +701,9 @@ impl TouchGestureRecognizer {
                     if raw_delta != Point::default() {
                         touch.last_movement = raw_delta;
                     }
-                    touch.velocity_tracker.push(now, event.position);
+                    touch
+                        .velocity_tracker
+                        .push(touch.event_time(event.timestamp, now), event.position);
                     touch.last_position = event.position;
                     let mut target = event.predicted_position.unwrap_or(event.position);
                     let mut delta = target - touch.emitted_position;
@@ -771,12 +788,13 @@ impl TouchGestureRecognizer {
                     // estimate. But a release long after the last movement
                     // means the finger had already stopped, so nothing
                     // flings.
+                    let event_time = touch.event_time(event.timestamp, now);
                     let finger_stopped =
                         touch
                             .velocity_tracker
                             .latest_sample_time()
                             .is_none_or(|latest| {
-                                now.duration_since(latest) > VELOCITY_ASSUME_STOPPED_GAP
+                                event_time.duration_since(latest) > VELOCITY_ASSUME_STOPPED_GAP
                             });
                     let mut velocity = if finger_stopped {
                         Point::default()
@@ -2206,6 +2224,7 @@ mod tests {
             position: point(px(x), px(y)),
             predicted_position: None,
             force: None,
+            timestamp: None,
         }
     }
 }

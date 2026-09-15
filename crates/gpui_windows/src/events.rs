@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::atomic::Ordering,
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -525,6 +526,7 @@ impl WindowsWindowInner {
                         position: replaced.position,
                         predicted_position: None,
                         force: None,
+                        timestamp: Some(Duration::from_millis(pointer_info.dwTime as u64)),
                     });
                 }
                 Some(touch)
@@ -548,6 +550,7 @@ impl WindowsWindowInner {
             position,
             predicted_position,
             force: None,
+            timestamp: Some(Duration::from_millis(pointer_info.dwTime as u64)),
         });
 
         // Consuming every message in a claimed touch sequence prevents Windows
@@ -580,6 +583,7 @@ impl WindowsWindowInner {
                 position: touch.position,
                 predicted_position: None,
                 force: None,
+                timestamp: None,
             });
         }
         claimed.then_some(0)
