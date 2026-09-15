@@ -768,25 +768,19 @@ impl TouchGestureRecognizer {
                         },
                     });
                 }
-                TouchGestureState::Panning { mut touch, axis } if touch.id == event.id => {
-                    // A terminal event commonly repeats the final move. Do
-                    // not add that stationary sample: it would dilute the
-                    // release velocity. Some Windows touch panels do report
-                    // a final displacement in the terminal event, though;
-                    // include that real movement so a flick ending between
-                    // move samples still has its true release velocity.
-                    let mut terminal_movement = event.position - touch.last_position;
-                    lock_delta_to_axis(&mut terminal_movement, axis);
-                    if !terminal_movement.is_zero() {
-                        touch.velocity_tracker.push(now, event.position);
-                    }
+                TouchGestureState::Panning { touch, axis } if touch.id == event.id => {
+                    // The release deliberately contributes no velocity
+                    // sample: it usually repeats the last movement's position
+                    // with a later timestamp, which would dilute the
+                    // estimate. But a release long after the last movement
+                    // means the finger had already stopped, so nothing
+                    // flings.
                     let finger_stopped =
                         touch
                             .velocity_tracker
                             .latest_sample_time()
                             .is_none_or(|latest| {
-                                terminal_movement.is_zero()
-                                    && now.duration_since(latest) > VELOCITY_ASSUME_STOPPED_GAP
+                                now.duration_since(latest) > VELOCITY_ASSUME_STOPPED_GAP
                             });
                     let mut velocity = if finger_stopped {
                         Point::default()
@@ -1696,25 +1690,6 @@ mod tests {
         recognizer.handle_event_at(
             &touch_event(touch, TouchPhase::Ended, 100., 220.),
             now + Duration::from_millis(96),
-        );
-
-        assert!(recognizer.has_momentum());
-    }
-
-    #[test]
-    fn terminal_movement_contributes_to_release_velocity() {
-        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
-        let now = Instant::now();
-        let touch = TouchId(1);
-
-        recognizer.handle_event_at(&touch_event(touch, TouchPhase::Started, 100., 300.), now);
-        recognizer.handle_event_at(
-            &touch_event(touch, TouchPhase::Moved, 100., 260.),
-            now + Duration::from_millis(16),
-        );
-        recognizer.handle_event_at(
-            &touch_event(touch, TouchPhase::Ended, 100., 220.),
-            now + Duration::from_millis(140),
         );
 
         assert!(recognizer.has_momentum());
