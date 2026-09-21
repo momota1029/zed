@@ -25,6 +25,7 @@ pub(crate) struct DirectManipulationHandler {
     _handler_cookie: u32,
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
+    gesture_position: Rc<Cell<Option<Point<Pixels>>>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
 }
 
@@ -64,12 +65,16 @@ impl DirectManipulationHandler {
             viewport.Enable()?;
 
             let scale_factor = Rc::new(Cell::new(scale_factor));
+            // Direct Manipulation callback には接触座標が来ない。mouse cursor を読むと
+            // touch 中に hit-test 先が変わり、nested scroll が背後へ漏れてしまう。
+            let gesture_position = Rc::new(Cell::new(None));
             let pending_events = Rc::new(RefCell::new(Vec::new()));
 
             let event_handler: IDirectManipulationViewportEventHandler =
                 DirectManipulationEventHandler::new(
                     window,
                     Rc::clone(&scale_factor),
+                    Rc::clone(&gesture_position),
                     Rc::clone(&pending_events),
                 )
                 .into();
@@ -85,6 +90,7 @@ impl DirectManipulationHandler {
                 _handler_cookie: handler_cookie,
                 window,
                 scale_factor,
+                gesture_position,
                 pending_events,
             })
         }
@@ -98,9 +104,22 @@ impl DirectManipulationHandler {
         unsafe {
             let pointer_id = wparam.loword() as u32;
             let mut pointer_type = POINTER_INPUT_TYPE::default();
-            if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
+            if GetPointerType(pointer_id, &mut pointer_type).is_ok()
+                && matches!(pointer_type, PT_TOUCH | PT_TOUCHPAD)
             {
-                self.viewport.SetContact(pointer_id).log_err();
+                let mut pointer_info = POINTER_INFO::default();
+                if GetPointerInfo(pointer_id, &mut pointer_info).is_ok() {
+                    let mut point = pointer_info.ptPixelLocation;
+                    let _ = ScreenToClient(self.window, &mut point);
+                    self.gesture_position.set(Some(logical_point(
+                        point.x as f32,
+                        point.y as f32,
+                        self.scale_factor.get(),
+                    )));
+                }
+                if pointer_type == PT_TOUCHPAD {
+                    self.viewport.SetContact(pointer_id).log_err();
+                }
             }
         }
     }
@@ -137,6 +156,7 @@ enum GestureKind {
 struct DirectManipulationEventHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
+    gesture_position: Rc<Cell<Option<Point<Pixels>>>>,
     gesture_kind: Cell<GestureKind>,
     last_scale: Cell<f32>,
     last_x_offset: Cell<f32>,
@@ -149,11 +169,13 @@ impl DirectManipulationEventHandler {
     fn new(
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
+        gesture_position: Rc<Cell<Option<Point<Pixels>>>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
     ) -> Self {
         Self {
             window,
             scale_factor,
+            gesture_position,
             gesture_kind: Cell::new(GestureKind::None),
             last_scale: Cell::new(1.0),
             last_x_offset: Cell::new(0.0),
@@ -164,7 +186,7 @@ impl DirectManipulationEventHandler {
     }
 
     fn end_gesture(&self) {
-        let position = self.mouse_position();
+        let position = self.gesture_position();
         let modifiers = current_modifiers();
         match self.gesture_kind.get() {
             GestureKind::Scroll => {
@@ -201,6 +223,12 @@ impl DirectManipulationEventHandler {
             logical_point(point.x as f32, point.y as f32, scale_factor)
         }
     }
+
+    fn gesture_position(&self) -> Point<Pixels> {
+        self.gesture_position
+            .get()
+            .unwrap_or_else(|| self.mouse_position())
+    }
 }
 
 impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHandler_Impl {
@@ -221,6 +249,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
 
         if current == DIRECTMANIPULATION_READY {
             self.end_gesture();
+            self.gesture_position.set(None);
 
             // Reset the content transform so the viewport is ready for the next gesture.
             // ZoomToRect triggers a second RUNNING -> READY cycle, so prevent an infinite loop here.
@@ -291,7 +320,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
             return Ok(());
         }
 
-        let position = self.mouse_position();
+        let position = self.gesture_position();
         let modifiers = current_modifiers();
 
         // Direct Manipulation reports both translation and scale in every content update.
