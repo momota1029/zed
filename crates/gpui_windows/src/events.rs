@@ -1,8 +1,10 @@
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io::Write as _,
     rc::Rc,
-    sync::atomic::Ordering,
+    sync::{Mutex, OnceLock, atomic::Ordering},
 };
 
 use anyhow::Context as _;
@@ -119,6 +121,114 @@ fn is_touch_promoted_mouse_message() -> bool {
     (extra_info & MI_WP_SIGNATURE_MASK) == MI_WP_SIGNATURE && (extra_info & MI_WP_FLAG_TOUCH) != 0
 }
 
+/// 実機ごとに異なる native touch の昇格順序を調べるための一時診断。
+/// `GPUI_NATIVE_TAP_TRACE` が指すファイルへ、移動を除く境界イベントだけを追記する。
+struct NativeTapTraceEvent(String);
+
+fn capture_native_tap_message(
+    handle: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    click_count: usize,
+) -> Option<NativeTapTraceEvent> {
+    static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+    if !TRACE_ENABLED.get_or_init(|| {
+        std::env::var_os("GPUI_NATIVE_TAP_TRACE").is_some_and(|value| !value.is_empty())
+    }) {
+        return None;
+    }
+    let name = match msg {
+        WM_POINTERDOWN => "POINTER_DOWN",
+        WM_POINTERUP => "POINTER_UP",
+        WM_POINTERCAPTURECHANGED => "POINTER_CAPTURE_CHANGED",
+        WM_LBUTTONDOWN => "LEFT_DOWN",
+        WM_LBUTTONDBLCLK => "LEFT_DOUBLE",
+        WM_LBUTTONUP => "LEFT_UP",
+        WM_RBUTTONDOWN => "RIGHT_DOWN",
+        WM_RBUTTONDBLCLK => "RIGHT_DOUBLE",
+        WM_RBUTTONUP => "RIGHT_UP",
+        _ => return None,
+    };
+
+    let message_time = unsafe { GetMessageTime() };
+    let extra_info = unsafe { GetMessageExtraInfo().0 as usize };
+    let touch_signature = (extra_info & MI_WP_SIGNATURE_MASK) == MI_WP_SIGNATURE;
+    let touch_flag = touch_signature && (extra_info & MI_WP_FLAG_TOUCH) != 0;
+    let mut pointer_id = 0;
+    let mut pointer_type = 0;
+    let mut pointer_flags = 0;
+    let mut pointer_info_ok = false;
+    let mut client_position = None;
+    let mut screen_position = None;
+    let capture_target = if msg == WM_POINTERCAPTURECHANGED {
+        Some(lparam.0 as usize)
+    } else {
+        None
+    };
+    if matches!(
+        msg,
+        WM_POINTERDOWN | WM_POINTERUP | WM_POINTERCAPTURECHANGED
+    ) {
+        pointer_id = wparam.loword() as u32;
+        let mut info = POINTER_INFO::default();
+        if unsafe { GetPointerInfo(pointer_id, &mut info) }.is_ok() {
+            pointer_info_ok = true;
+            pointer_type = info.pointerType.0;
+            pointer_flags = info.pointerFlags.0;
+            screen_position = Some(info.ptPixelLocation);
+            let mut client = info.ptPixelLocation;
+            if unsafe { ScreenToClient(handle, &mut client) }.as_bool() {
+                client_position = Some(client);
+            }
+        }
+    } else {
+        let client = POINT {
+            x: lparam.signed_loword() as i32,
+            y: lparam.signed_hiword() as i32,
+        };
+        client_position = Some(client);
+        let mut screen = client;
+        if unsafe { ClientToScreen(handle, &mut screen) }.as_bool() {
+            screen_position = Some(screen);
+        }
+    }
+
+    let client_x = client_position.map(|position| position.x);
+    let client_y = client_position.map(|position| position.y);
+    let screen_x = screen_position.map(|position| position.x);
+    let screen_y = screen_position.map(|position| position.y);
+    Some(NativeTapTraceEvent(format!(
+        "time_ms={message_time} event={name} hwnd=0x{:016x} pointer_id={pointer_id} pointer_info_ok={pointer_info_ok} pointer_type={pointer_type} flags=0x{pointer_flags:08x} client_x={client_x:?} client_y={client_y:?} screen_x={screen_x:?} screen_y={screen_y:?} capture_target={capture_target:?} extra=0x{extra_info:016x} touch_signature={touch_signature} touch_flag={touch_flag} click_count_before={click_count}",
+        handle.0 as usize,
+    )))
+}
+
+fn write_native_tap_message(event: Option<NativeTapTraceEvent>) {
+    static TRACE_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+    let Some(event) = event else { return };
+    let Some(file) = TRACE_FILE
+        .get_or_init(|| {
+            let path = std::env::var_os("GPUI_NATIVE_TAP_TRACE")?;
+            if path.is_empty() {
+                return None;
+            }
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "{}", event.0);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ActiveTouch {
     id: TouchId,
@@ -187,6 +297,13 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        let tap_trace = capture_native_tap_message(
+            handle,
+            msg,
+            wparam,
+            lparam,
+            self.state.click_state.current_count.get(),
+        );
         let handled = match msg {
             // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
             // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
@@ -302,11 +419,13 @@ impl WindowsWindowInner {
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             _ => None,
         };
-        if let Some(n) = handled {
+        let result = if let Some(n) = handled {
             LRESULT(n)
         } else {
             unsafe { DefWindowProcW(handle, msg, wparam, lparam) }
-        }
+        };
+        write_native_tap_message(tap_trace);
+        result
     }
 
     fn handle_end_session_msg(&self, wparam: WPARAM) -> Option<isize> {
