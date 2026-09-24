@@ -1185,6 +1185,7 @@ pub struct Window {
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
+    file_drop_context: Option<crate::FileDropContext>,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -2048,6 +2049,7 @@ impl Window {
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
+            file_drop_context: None,
             mouse_position,
             mouse_hit_test: HitTest::default(),
             modifiers,
@@ -5312,6 +5314,21 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let previous_file_drop_context = std::mem::replace(
+            &mut self.file_drop_context,
+            if matches!(
+                &event,
+                PlatformInput::FileDrop(
+                    FileDropEvent::Entered { .. }
+                        | FileDropEvent::Pending { .. }
+                        | FileDropEvent::Submit { .. }
+                )
+            ) {
+                crate::interactive::current_file_drop_context()
+            } else {
+                None
+            },
+        );
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -5468,6 +5485,8 @@ impl Window {
         // is the last chance for drag listeners to see the pointer leave and reset their state.
         self.promote_external_drag_to_platform(&event, cx);
 
+        self.file_drop_context = previous_file_drop_context;
+
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
             self.input_rate_tracker.borrow_mut().record_input();
@@ -5479,6 +5498,12 @@ impl Window {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
         }
+    }
+
+    /// Returns file-drop provenance and its synchronous platform response handle
+    /// while handling an Entered, Pending, or Submit interaction.
+    pub fn file_drop_context(&self) -> Option<&crate::FileDropContext> {
+        self.file_drop_context.as_ref()
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
@@ -7490,12 +7515,13 @@ mod tests {
 
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
-        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
-        LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
-        PlatformInput, Point, Render, RequestFrameOptions, StatefulInteractiveElement as _, Styled,
-        TestAppContext, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropContext, FileDropEffect,
+        FileDropEvent, FileDropResponse, FocusHandle, InputEvent as _, InteractiveElement as _,
+        IntoElement, KeyDownEvent, Keystroke, LocalDragSessionToken, LongPressEvent, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
+        Render, RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext,
+        TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, WindowAppearance, WindowOptions,
+        canvas, div, point, px, size,
     };
 
     /// Visibility transitions reach observers exactly once each, with the new
@@ -7994,6 +8020,111 @@ mod tests {
         path: PathBuf,
         observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
         observed_drops: Rc<RefCell<Vec<PathBuf>>>,
+    }
+
+    struct FileDropTransportView(Rc<RefCell<Vec<(i32, u64)>>>);
+
+    impl Render for FileDropTransportView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .on_mouse_move({
+                    let events = self.0.clone();
+                    move |event: &MouseMoveEvent, window, _| {
+                        let Some(context) = window.file_drop_context() else {
+                            return;
+                        };
+                        let effect = match event.position.x.0 as i32 {
+                            10 => FileDropEffect::None,
+                            20 => FileDropEffect::Copy,
+                            _ => return,
+                        };
+                        events.borrow_mut().push((
+                            effect as i32,
+                            context.local_drag_session.expect("test token").value(),
+                        ));
+                        context.response.set_effect(effect);
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, {
+                    let events = self.0.clone();
+                    move |event: &MouseUpEvent, window, _| {
+                        let Some(context) = window.file_drop_context() else {
+                            return;
+                        };
+                        events.borrow_mut().push((
+                            FileDropEffect::Move as i32,
+                            context.local_drag_session.expect("test token").value(),
+                        ));
+                        assert_eq!(
+                            context
+                                .paths
+                                .as_ref()
+                                .map(|paths| paths.paths()[0].as_path()),
+                            Some(std::path::Path::new("drop-current.txt")),
+                        );
+                        context.response.set_effect(FileDropEffect::Move);
+                        assert_eq!(event.position.x.0 as i32, 30);
+                    }
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn file_drop_transport_reaches_enter_pending_and_submit_mouse_handlers(
+        cx: &mut TestAppContext,
+    ) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let events = events.clone();
+            move |_, _| FileDropTransportView(events)
+        });
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            for (position, expected_effect) in [
+                (point(px(10.), px(10.)), FileDropEffect::None),
+                (point(px(20.), px(20.)), FileDropEffect::Copy),
+                (point(px(30.), px(30.)), FileDropEffect::Move),
+            ] {
+                let paths = (position.x == px(10.))
+                    .then(|| ExternalPaths([PathBuf::from("entered.txt")].into_iter().collect()))
+                    .or_else(|| {
+                        (position.x == px(30.)).then(|| {
+                            ExternalPaths([PathBuf::from("drop-current.txt")].into_iter().collect())
+                        })
+                    });
+                let context = FileDropContext {
+                    local_drag_session: Some(LocalDragSessionToken::new(0x1234)),
+                    paths,
+                    response: FileDropResponse::default(),
+                };
+                let event = if position.x == px(30.) {
+                    FileDropEvent::Submit { position }
+                } else if position.x == px(10.) {
+                    FileDropEvent::Entered {
+                        position,
+                        paths: ExternalPaths::default(),
+                    }
+                } else {
+                    FileDropEvent::Pending { position }
+                };
+                crate::with_file_drop_context(context.clone(), || {
+                    window.dispatch_event(event.to_platform_input(), cx);
+                });
+                assert_eq!(context.response.effect(), Some(expected_effect));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                (FileDropEffect::None as i32, 0x1234),
+                (FileDropEffect::Copy as i32, 0x1234),
+                (FileDropEffect::Move as i32, 0x1234)
+            ]
+        );
     }
 
     struct FileDropExitView(Rc<Cell<usize>>);

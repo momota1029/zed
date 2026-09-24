@@ -3,7 +3,109 @@ use crate::{
     Point, Render, TouchDragEvent, Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+use std::{
+    any::Any,
+    cell::RefCell,
+    fmt::Debug,
+    ops::Deref,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
+
+/// Opaque identity attached to a drag started inside the application.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LocalDragSessionToken(u64);
+
+impl LocalDragSessionToken {
+    /// Creates a token from the platform's opaque session identifier.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the opaque identifier for transport to the application layer.
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// The effect a file drop handler authorizes the platform to report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDropEffect {
+    /// The target rejects the drop.
+    None,
+    /// The target accepts a copy operation.
+    Copy,
+    /// The target accepts a move operation.
+    Move,
+}
+
+/// A synchronous response slot shared with the platform drop callback.
+#[derive(Clone, Debug)]
+pub struct FileDropResponse(Arc<AtomicU8>);
+
+impl Default for FileDropResponse {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU8::new(0)))
+    }
+}
+
+impl FileDropResponse {
+    /// Sets the effect that the platform drop callback should return.
+    pub fn set_effect(&self, effect: FileDropEffect) {
+        let value = match effect {
+            FileDropEffect::None => 1,
+            FileDropEffect::Copy => 2,
+            FileDropEffect::Move => 3,
+        };
+        self.0.store(value, Ordering::SeqCst);
+    }
+
+    /// Returns the effect set during this event dispatch, if any.
+    pub fn effect(&self) -> Option<FileDropEffect> {
+        match self.0.load(Ordering::SeqCst) {
+            1 => Some(FileDropEffect::None),
+            2 => Some(FileDropEffect::Copy),
+            3 => Some(FileDropEffect::Move),
+            _ => None,
+        }
+    }
+}
+
+/// Drag provenance and response handle available during file-drop dispatch.
+#[derive(Clone, Debug, Default)]
+pub struct FileDropContext {
+    /// Present only when the data object carries a valid local session token.
+    pub local_drag_session: Option<LocalDragSessionToken>,
+    /// Current CF_HDROP paths, refreshed from the data object for each event that can submit.
+    pub paths: Option<ExternalPaths>,
+    /// Handle for synchronously selecting the effect returned by the platform.
+    pub response: FileDropResponse,
+}
+
+thread_local! {
+    static FILE_DROP_CONTEXT: RefCell<Option<FileDropContext>> = const { RefCell::new(None) };
+}
+
+/// Runs a platform file-drop callback with its transport context installed.
+pub fn with_file_drop_context<R>(context: FileDropContext, callback: impl FnOnce() -> R) -> R {
+    struct Restore(Option<FileDropContext>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FILE_DROP_CONTEXT.with(|current| *current.borrow_mut() = self.0.take());
+        }
+    }
+
+    let previous = FILE_DROP_CONTEXT.with(|current| current.borrow_mut().replace(context));
+    let _restore = Restore(previous);
+    callback()
+}
+
+pub(crate) fn current_file_drop_context() -> Option<FileDropContext> {
+    FILE_DROP_CONTEXT.with(|current| current.borrow().clone())
+}
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {

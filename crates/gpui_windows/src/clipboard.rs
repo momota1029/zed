@@ -127,24 +127,30 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
     Some(ClipboardItem { entries })
 }
 
-pub(crate) fn with_file_names<F>(hdrop: HDROP, mut f: F)
+pub(crate) fn with_file_names<F>(hdrop: HDROP, mut f: F) -> bool
 where
     F: FnMut(String),
 {
     let file_count = unsafe { DragQueryFileW(hdrop, DRAGDROP_GET_FILES_COUNT, None) };
+    let mut all_names_read = file_count > 0;
     for file_index in 0..file_count {
         let filename_length = unsafe { DragQueryFileW(hdrop, file_index, None) } as usize;
         let mut buffer = vec![0u16; filename_length + 1];
         let ret = unsafe { DragQueryFileW(hdrop, file_index, Some(buffer.as_mut_slice())) };
         if ret == 0 {
             log::error!("unable to read file name of dragged file");
+            all_names_read = false;
             continue;
         }
         match String::from_utf16(&buffer[0..filename_length]) {
             Ok(file_name) => f(file_name),
-            Err(e) => log::error!("dragged file name is not UTF-16: {}", e),
+            Err(e) => {
+                log::error!("dragged file name is not UTF-16: {}", e);
+                all_names_read = false;
+            }
         }
     }
+    all_names_read
 }
 
 fn set_clipboard_bytes<T>(data: &[T], format: u32) -> Result<()> {

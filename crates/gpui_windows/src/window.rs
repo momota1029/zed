@@ -21,7 +21,13 @@ use windows::{
         Graphics::Dwm::*,
         Graphics::Gdi::*,
         System::{
-            Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
+            Com::*,
+            DataExchange::RegisterClipboardFormatW,
+            Diagnostics::Debug::MessageBeep,
+            LibraryLoader::*,
+            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+            Ole::*,
+            SystemServices::*,
         },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -1134,14 +1140,75 @@ impl accesskit::ActionHandler for A11yActionHandler {
 }
 
 #[implement(IDropTarget)]
-struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
+struct WindowsDragDropHandler {
+    window: Rc<WindowsWindowInner>,
+    local_drag_session: Cell<Option<LocalDragSessionToken>>,
+    supports_file_drop: Cell<bool>,
+    callback_dispatch: FileDropEventDispatch,
+}
+
+#[derive(Default)]
+struct FileDropEventDispatch {
+    active: Cell<bool>,
+    reentered: Cell<bool>,
+    terminal_requested: Cell<bool>,
+}
+
+struct FileDropEventGuard<'a>(&'a Cell<bool>);
+
+impl Drop for FileDropEventGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+impl FileDropEventDispatch {
+    fn enter(&self, terminal_if_reentered: bool) -> Option<FileDropEventGuard<'_>> {
+        if self.active.replace(true) {
+            self.reentered.set(true);
+            self.terminal_requested
+                .set(self.terminal_requested.get() || terminal_if_reentered);
+            None
+        } else {
+            Some(FileDropEventGuard(&self.active))
+        }
+    }
+
+    fn take_reentry(&self) -> (bool, bool) {
+        (
+            self.reentered.replace(false),
+            self.terminal_requested.replace(false),
+        )
+    }
+}
 
 impl WindowsDragDropHandler {
-    fn handle_drag_drop(&self, input: PlatformInput) {
-        if let Some(mut func) = self.0.state.callbacks.input.take() {
-            func(input);
-            self.0.state.callbacks.input.set(Some(func));
+    fn handle_drag_drop(&self, input: PlatformInput, context: FileDropContext) -> bool {
+        let Some(mut func) = self.window.state.callbacks.input.take() else {
+            return false;
+        };
+        with_file_drop_context(context, || func(input));
+        self.window.state.callbacks.input.set(Some(func));
+        true
+    }
+
+    fn finish_reentered_event(&self, had_session: bool, terminal: bool) {
+        self.supports_file_drop.set(false);
+        self.local_drag_session.set(None);
+        if had_session {
+            self.handle_drag_drop(
+                PlatformInput::FileDrop(FileDropEvent::Exited),
+                FileDropContext::default(),
+            );
         }
+        let (_, nested_terminal) = self.callback_dispatch.take_reentry();
+        if terminal || nested_terminal {
+            self.handle_drag_drop(
+                PlatformInput::FileDrop(FileDropEvent::Ended),
+                FileDropContext::default(),
+            );
+        }
+        self.callback_dispatch.take_reentry();
     }
 }
 
@@ -1154,53 +1221,65 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        let Some(_event_guard) = self.callback_dispatch.enter(false) else {
+            unsafe { *pdweffect = DROPEFFECT_NONE };
+            return Ok(());
+        };
         unsafe {
+            let allowed_effects = *pdweffect;
+            *pdweffect = DROPEFFECT_NONE;
+            self.supports_file_drop.set(false);
+            self.local_drag_session.set(None);
             let idata_obj = pdataobj.ok()?;
-            let config = FORMATETC {
-                cfFormat: CF_HDROP.0,
-                ptd: std::ptr::null_mut() as _,
-                dwAspect: DVASPECT_CONTENT.0,
-                lindex: -1,
-                tymed: TYMED_HGLOBAL.0 as _,
-            };
-            let cursor_position = POINT { x: pt.x, y: pt.y };
-            if idata_obj.QueryGetData(&config as _) == S_OK {
-                *pdweffect = DROPEFFECT_COPY;
-                let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
-                    return Ok(());
-                };
-                if idata.u.hGlobal.is_invalid() {
-                    return Ok(());
-                }
-                let hdrop = HDROP(idata.u.hGlobal.0);
-                let mut paths = SmallVec::<[PathBuf; 2]>::new();
-                with_file_names(hdrop, |file_name| {
-                    if let Some(path) = PathBuf::from_str(&file_name).log_err() {
-                        paths.push(path);
-                    }
-                });
-                ReleaseStgMedium(&mut idata);
-                let mut cursor_position = cursor_position;
-                ScreenToClient(self.0.hwnd, &mut cursor_position)
+            let screen_position = POINT { x: pt.x, y: pt.y };
+            if let Some(paths) = read_file_drop_paths(idata_obj) {
+                self.supports_file_drop.set(true);
+                self.local_drag_session
+                    .set(read_local_drag_session(idata_obj));
+                let mut client_position = screen_position;
+                ScreenToClient(self.window.hwnd, &mut client_position)
                     .ok()
                     .log_err();
-                let scale_factor = self.0.state.scale_factor.get();
+                let scale_factor = self.window.state.scale_factor.get();
+                let response = FileDropResponse::default();
                 let input = PlatformInput::FileDrop(FileDropEvent::Entered {
                     position: logical_point(
-                        cursor_position.x as f32,
-                        cursor_position.y as f32,
+                        client_position.x as f32,
+                        client_position.y as f32,
                         scale_factor,
                     ),
-                    paths: ExternalPaths(paths),
+                    paths: paths.clone(),
                 });
-                self.handle_drag_drop(input);
+                let callback_present = self.handle_drag_drop(
+                    input,
+                    FileDropContext {
+                        local_drag_session: self.local_drag_session.get(),
+                        paths: Some(paths),
+                        response: response.clone(),
+                    },
+                );
+                *pdweffect = resolve_drop_effect(
+                    response.effect(),
+                    callback_present,
+                    self.supports_file_drop.get(),
+                    allowed_effects,
+                );
             } else {
+                self.supports_file_drop.set(false);
+                self.local_drag_session.set(None);
                 *pdweffect = DROPEFFECT_NONE;
             }
-            self.0
+            self.window
                 .drop_target_helper
-                .DragEnter(self.0.hwnd, idata_obj, &cursor_position, *pdweffect)
+                .DragEnter(self.window.hwnd, idata_obj, &screen_position, *pdweffect)
                 .log_err();
+            let (reentered, terminal) = self.callback_dispatch.take_reentry();
+            if reentered {
+                let had_session = self.supports_file_drop.get();
+                *pdweffect = DROPEFFECT_NONE;
+                self.window.drop_target_helper.DragLeave().log_err();
+                self.finish_reentered_event(had_session, terminal);
+            }
         }
         Ok(())
     }
@@ -1211,36 +1290,92 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
-        let mut cursor_position = POINT { x: pt.x, y: pt.y };
+        let Some(_event_guard) = self.callback_dispatch.enter(false) else {
+            unsafe { *pdweffect = DROPEFFECT_NONE };
+            return Ok(());
+        };
+        let screen_position = POINT { x: pt.x, y: pt.y };
+        let mut client_position = screen_position;
+        let allowed_effects = unsafe { *pdweffect };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
-            self.0
-                .drop_target_helper
-                .DragOver(&cursor_position, *pdweffect)
-                .log_err();
-            ScreenToClient(self.0.hwnd, &mut cursor_position)
+            *pdweffect = DROPEFFECT_NONE;
+        }
+        if !self.supports_file_drop.get() {
+            unsafe {
+                self.window
+                    .drop_target_helper
+                    .DragOver(&screen_position, DROPEFFECT_NONE)
+                    .log_err();
+            }
+            let (reentered, terminal) = self.callback_dispatch.take_reentry();
+            if reentered {
+                unsafe { *pdweffect = DROPEFFECT_NONE };
+                self.finish_reentered_event(false, terminal);
+            }
+            return Ok(());
+        }
+        unsafe {
+            ScreenToClient(self.window.hwnd, &mut client_position)
                 .ok()
                 .log_err();
         }
-        let scale_factor = self.0.state.scale_factor.get();
+        let scale_factor = self.window.state.scale_factor.get();
+        let response = FileDropResponse::default();
         let input = PlatformInput::FileDrop(FileDropEvent::Pending {
             position: logical_point(
-                cursor_position.x as f32,
-                cursor_position.y as f32,
+                client_position.x as f32,
+                client_position.y as f32,
                 scale_factor,
             ),
         });
-        self.handle_drag_drop(input);
+        let callback_present = self.handle_drag_drop(
+            input,
+            FileDropContext {
+                local_drag_session: self.local_drag_session.get(),
+                paths: None,
+                response: response.clone(),
+            },
+        );
+        unsafe {
+            *pdweffect = resolve_drop_effect(
+                response.effect(),
+                callback_present,
+                self.supports_file_drop.get(),
+                allowed_effects,
+            );
+            self.window
+                .drop_target_helper
+                .DragOver(&screen_position, *pdweffect)
+                .log_err();
+        }
+        let (reentered, terminal) = self.callback_dispatch.take_reentry();
+        if reentered {
+            let had_session = self.supports_file_drop.get();
+            unsafe {
+                *pdweffect = DROPEFFECT_NONE;
+                self.window.drop_target_helper.DragLeave().log_err();
+            }
+            self.finish_reentered_event(had_session, terminal);
+        }
 
         Ok(())
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
+        let Some(_event_guard) = self.callback_dispatch.enter(true) else {
+            return Ok(());
+        };
         unsafe {
-            self.0.drop_target_helper.DragLeave().log_err();
+            self.window.drop_target_helper.DragLeave().log_err();
         }
         let input = PlatformInput::FileDrop(FileDropEvent::Exited);
-        self.handle_drag_drop(input);
+        self.handle_drag_drop(input, FileDropContext::default());
+        self.supports_file_drop.set(false);
+        self.local_drag_session.set(None);
+        let (reentered, terminal) = self.callback_dispatch.take_reentry();
+        if reentered {
+            self.finish_reentered_event(false, terminal);
+        }
 
         Ok(())
     }
@@ -1252,30 +1387,250 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
-        let idata_obj = pdataobj.ok()?;
-        let mut cursor_position = POINT { x: pt.x, y: pt.y };
+        let Some(_event_guard) = self.callback_dispatch.enter(true) else {
+            unsafe { *pdweffect = DROPEFFECT_NONE };
+            return Ok(());
+        };
+        let allowed_effects = unsafe { *pdweffect };
+        unsafe { *pdweffect = DROPEFFECT_NONE };
+        let supports_file_drop = self.supports_file_drop.replace(false);
+        let entered_session = self.local_drag_session.replace(None);
+        let idata_obj = match pdataobj.ok() {
+            Ok(data_object) => data_object,
+            Err(_) => {
+                if supports_file_drop {
+                    unsafe { self.window.drop_target_helper.DragLeave().log_err() };
+                    self.handle_drag_drop(
+                        PlatformInput::FileDrop(FileDropEvent::Exited),
+                        FileDropContext::default(),
+                    );
+                    self.handle_drag_drop(
+                        PlatformInput::FileDrop(FileDropEvent::Ended),
+                        FileDropContext::default(),
+                    );
+                }
+                self.callback_dispatch.take_reentry();
+                return Ok(());
+            }
+        };
+        let screen_position = POINT { x: pt.x, y: pt.y };
+        let mut client_position = screen_position;
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
-            self.0
-                .drop_target_helper
-                .Drop(idata_obj, &cursor_position, *pdweffect)
-                .log_err();
-            ScreenToClient(self.0.hwnd, &mut cursor_position)
+            *pdweffect = DROPEFFECT_NONE;
+            ScreenToClient(self.window.hwnd, &mut client_position)
                 .ok()
                 .log_err();
         }
-        let scale_factor = self.0.state.scale_factor.get();
-        let input = PlatformInput::FileDrop(FileDropEvent::Submit {
-            position: logical_point(
-                cursor_position.x as f32,
-                cursor_position.y as f32,
-                scale_factor,
-            ),
-        });
-        self.handle_drag_drop(input);
-
+        let scale_factor = self.window.state.scale_factor.get();
+        let effect = run_file_drop_dispatch(
+            &self.callback_dispatch,
+            supports_file_drop,
+            entered_session,
+            allowed_effects,
+            || {
+                let paths = read_file_drop_paths(idata_obj)?;
+                let session = read_local_drag_session(idata_obj);
+                Some((paths, session))
+            },
+            |context| {
+                self.handle_drag_drop(
+                    PlatformInput::FileDrop(FileDropEvent::Submit {
+                        position: logical_point(
+                            client_position.x as f32,
+                            client_position.y as f32,
+                            scale_factor,
+                        ),
+                    }),
+                    context,
+                )
+            },
+            |effect| unsafe {
+                self.window
+                    .drop_target_helper
+                    .Drop(idata_obj, &screen_position, effect)
+                    .log_err();
+            },
+            || unsafe {
+                self.window.drop_target_helper.DragLeave().log_err();
+            },
+            |event| {
+                self.handle_drag_drop(PlatformInput::FileDrop(event), FileDropContext::default());
+            },
+        );
+        unsafe { *pdweffect = effect };
+        self.supports_file_drop.set(false);
+        self.local_drag_session.set(None);
         Ok(())
     }
+}
+
+fn resolve_drop_effect(
+    effect: Option<FileDropEffect>,
+    callback_present: bool,
+    valid_cf_hdrop: bool,
+    allowed_effects: DROPEFFECT,
+) -> DROPEFFECT {
+    if !callback_present || !valid_cf_hdrop {
+        return DROPEFFECT_NONE;
+    }
+
+    let requested = match effect {
+        Some(FileDropEffect::None) => DROPEFFECT_NONE,
+        Some(FileDropEffect::Copy) => DROPEFFECT_COPY,
+        Some(FileDropEffect::Move) => DROPEFFECT_MOVE,
+        None => DROPEFFECT_COPY,
+    };
+    if requested == DROPEFFECT_NONE || requested.0 & allowed_effects.0 == 0 {
+        DROPEFFECT_NONE
+    } else {
+        requested
+    }
+}
+
+fn can_dispatch_file_drop_submit(
+    valid_cf_hdrop: bool,
+    session_matches: bool,
+    supports_file_drop: bool,
+    reentered_before_submit: bool,
+) -> bool {
+    valid_cf_hdrop && session_matches && supports_file_drop && !reentered_before_submit
+}
+
+fn run_file_drop_dispatch(
+    dispatch: &FileDropEventDispatch,
+    supports_file_drop: bool,
+    entered_session: Option<LocalDragSessionToken>,
+    allowed_effects: DROPEFFECT,
+    read_payload: impl FnOnce() -> Option<(ExternalPaths, Option<LocalDragSessionToken>)>,
+    submit: impl FnOnce(FileDropContext) -> bool,
+    helper_drop: impl FnOnce(DROPEFFECT),
+    helper_leave: impl FnOnce(),
+    mut notify: impl FnMut(FileDropEvent),
+) -> DROPEFFECT {
+    let payload = read_payload();
+    let (reentered_before_submit, terminal_before_submit) = dispatch.take_reentry();
+    let valid_cf_hdrop = payload.is_some();
+    let (paths, drop_session) = payload
+        .map(|(paths, session)| (Some(paths), session))
+        .unwrap_or((None, None));
+    let session_matches = entered_session == drop_session;
+    let can_submit = can_dispatch_file_drop_submit(
+        valid_cf_hdrop,
+        session_matches,
+        supports_file_drop,
+        reentered_before_submit,
+    );
+    let response = FileDropResponse::default();
+    let callback_present = if let (Some(paths), true) = (paths, can_submit) {
+        submit(FileDropContext {
+            local_drag_session: drop_session,
+            paths: Some(paths),
+            response: response.clone(),
+        })
+    } else {
+        false
+    };
+    let (reentered_during_submit, terminal_during_submit) = dispatch.take_reentry();
+    let reentered = reentered_before_submit || reentered_during_submit;
+    let mut terminal = terminal_before_submit || terminal_during_submit;
+    let mut should_exit = supports_file_drop && (!can_submit || !callback_present || reentered);
+    let effect = resolve_drop_effect(
+        response.effect(),
+        callback_present,
+        valid_cf_hdrop && session_matches && supports_file_drop,
+        allowed_effects,
+    );
+
+    // Submit が同期的に操作を受理した後の再入では、返却 effect と受理結果を一致させる。
+    helper_drop(effect);
+    let (reentered_after_helper, terminal_after_helper) = dispatch.take_reentry();
+    if reentered_after_helper {
+        terminal |= terminal_after_helper;
+        should_exit |= supports_file_drop;
+        helper_leave();
+        let (_, terminal_during_leave) = dispatch.take_reentry();
+        terminal |= terminal_during_leave;
+    }
+    if should_exit {
+        notify(FileDropEvent::Exited);
+    }
+    if supports_file_drop || terminal {
+        notify(FileDropEvent::Ended);
+    }
+    dispatch.take_reentry();
+    effect
+}
+
+fn read_file_drop_paths(data_object: &IDataObject) -> Option<ExternalPaths> {
+    let config = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut() as _,
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as _,
+    };
+    unsafe {
+        if data_object.QueryGetData(&config) != S_OK {
+            return None;
+        }
+        let mut medium = data_object.GetData(&config).ok()?;
+        if medium.u.hGlobal.is_invalid() {
+            ReleaseStgMedium(&mut medium);
+            return None;
+        }
+
+        let mut paths = SmallVec::<[PathBuf; 2]>::new();
+        let all_names_read = with_file_names(HDROP(medium.u.hGlobal.0), |file_name| {
+            if let Some(path) = PathBuf::from_str(&file_name).log_err() {
+                paths.push(path);
+            }
+        });
+        ReleaseStgMedium(&mut medium);
+        (all_names_read && !paths.is_empty()).then_some(ExternalPaths(paths))
+    }
+}
+
+fn read_local_drag_session(data_object: &IDataObject) -> Option<LocalDragSessionToken> {
+    let format = unsafe { RegisterClipboardFormatW(w!("GPUI.Filer.InternalDragSession")) };
+    if format == 0 {
+        return None;
+    }
+
+    let config = FORMATETC {
+        cfFormat: format as u16,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as _,
+    };
+    if unsafe { data_object.QueryGetData(&config) } != S_OK {
+        return None;
+    }
+
+    let mut medium = unsafe { data_object.GetData(&config).ok()? };
+    let global = unsafe { medium.u.hGlobal };
+    if global.is_invalid() || unsafe { GlobalSize(global) } != 8 {
+        unsafe { ReleaseStgMedium(&mut medium) };
+        return None;
+    }
+
+    let pointer = unsafe { GlobalLock(global) };
+    if pointer.is_null() {
+        unsafe { ReleaseStgMedium(&mut medium) };
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), 8) };
+    let token = decode_local_drag_session(bytes);
+    unsafe {
+        let _ = GlobalUnlock(global).ok();
+        ReleaseStgMedium(&mut medium);
+    }
+    token
+}
+
+fn decode_local_drag_session(bytes: &[u8]) -> Option<LocalDragSessionToken> {
+    let bytes: [u8; 8] = bytes.try_into().ok()?;
+    Some(LocalDragSessionToken::new(u64::from_le_bytes(bytes)))
 }
 
 #[derive(Debug, Clone)]
@@ -1544,7 +1899,12 @@ fn get_module_handle() -> HMODULE {
 
 fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
     let window_handle = window.hwnd;
-    let handler = WindowsDragDropHandler(window.clone());
+    let handler = WindowsDragDropHandler {
+        window: window.clone(),
+        local_drag_session: Cell::new(None),
+        supports_file_drop: Cell::new(false),
+        callback_dispatch: FileDropEventDispatch::default(),
+    };
     // The lifetime of `IDropTarget` is handled by Windows, it won't release until
     // we call `RevokeDragDrop`.
     // So, it's safe to drop it here.
@@ -1714,9 +2074,232 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
-    use gpui::{DevicePixels, MouseButton, point};
-    use std::time::Duration;
+    use super::{
+        ClickState, FileDropEventDispatch, decode_local_drag_session, resolve_drop_effect,
+        run_file_drop_dispatch,
+    };
+    use gpui::{
+        DevicePixels, ExternalPaths, FileDropEvent, LocalDragSessionToken, MouseButton, point,
+    };
+    use std::{cell::RefCell, path::PathBuf, time::Duration};
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE};
+
+    #[test]
+    fn file_drop_effect_mapping_requires_callback_and_preserves_legacy_copy() {
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::None),
+                true,
+                true,
+                DROPEFFECT_COPY
+            ),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Copy),
+                true,
+                true,
+                DROPEFFECT_COPY
+            ),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Move),
+                true,
+                true,
+                DROPEFFECT_MOVE
+            ),
+            DROPEFFECT_MOVE
+        );
+        assert_eq!(
+            resolve_drop_effect(None, true, true, DROPEFFECT_COPY),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(
+            resolve_drop_effect(None, false, true, DROPEFFECT_COPY),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            resolve_drop_effect(None, true, false, DROPEFFECT_COPY),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Copy),
+                true,
+                false,
+                DROPEFFECT_COPY,
+            ),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Move),
+                true,
+                false,
+                DROPEFFECT_MOVE,
+            ),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Move),
+                true,
+                true,
+                DROPEFFECT_COPY,
+            ),
+            DROPEFFECT_NONE
+        );
+    }
+
+    #[test]
+    fn malformed_or_absent_local_session_formats_are_external() {
+        assert_eq!(decode_local_drag_session(&[]), None);
+        assert_eq!(decode_local_drag_session(&[1; 7]), None);
+        assert_eq!(decode_local_drag_session(&[1; 9]), None);
+        assert_eq!(
+            decode_local_drag_session(&0x0102_0304_0506_0708_u64.to_le_bytes())
+                .map(|token| token.value()),
+            Some(0x0102_0304_0506_0708)
+        );
+    }
+
+    #[test]
+    fn nested_file_drop_callback_is_rejected_without_replacing_outer_dispatch() {
+        let dispatch = FileDropEventDispatch::default();
+        let outer = dispatch.enter(false).expect("outer event should start");
+
+        assert!(dispatch.enter(true).is_none());
+        assert!(dispatch.active.get());
+        assert_eq!(dispatch.take_reentry(), (true, true));
+        assert_eq!(dispatch.take_reentry(), (false, false));
+
+        drop(outer);
+        assert!(dispatch.enter(false).is_some());
+    }
+
+    #[test]
+    fn reentry_before_submit_rejects_but_after_submit_keeps_the_accepted_effect() {
+        assert!(!super::can_dispatch_file_drop_submit(
+            true, true, true, true
+        ));
+        assert!(super::can_dispatch_file_drop_submit(
+            true, true, true, false
+        ));
+
+        // Submit がキュー受理を返した後の再入は、受理済みeffectを取り消さない。
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Move),
+                true,
+                true,
+                DROPEFFECT_MOVE,
+            ),
+            DROPEFFECT_MOVE,
+        );
+    }
+
+    #[test]
+    fn nested_leave_during_payload_read_rejects_submit_and_closes_once() {
+        let dispatch = FileDropEventDispatch::default();
+        let _outer = dispatch.enter(true).expect("outer Drop should start");
+        let token = LocalDragSessionToken::new(7);
+        let submitted = RefCell::new(false);
+        let helper_effects = RefCell::new(Vec::new());
+        let notifications = RefCell::new(Vec::new());
+
+        let effect = run_file_drop_dispatch(
+            &dispatch,
+            true,
+            Some(token),
+            DROPEFFECT_COPY,
+            || {
+                assert!(dispatch.enter(true).is_none());
+                Some((
+                    ExternalPaths([PathBuf::from("replacement.txt")].into_iter().collect()),
+                    Some(token),
+                ))
+            },
+            |_| {
+                submitted.replace(true);
+                true
+            },
+            |effect| helper_effects.borrow_mut().push(effect.0),
+            || {},
+            |event| {
+                notifications.borrow_mut().push(match event {
+                    FileDropEvent::Exited => "exited",
+                    FileDropEvent::Ended => "ended",
+                    _ => "unexpected",
+                });
+            },
+        );
+
+        assert!(!submitted.into_inner());
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert_eq!(helper_effects.into_inner(), [DROPEFFECT_NONE.0]);
+        assert_eq!(notifications.into_inner(), ["exited", "ended"]);
+    }
+
+    #[test]
+    fn reentry_after_submit_and_during_helper_preserves_effect_and_closes_once() {
+        for reenter_in_helper in [false, true] {
+            let dispatch = FileDropEventDispatch::default();
+            let _outer = dispatch.enter(true).expect("outer Drop should start");
+            let token = LocalDragSessionToken::new(9);
+            let helper_effects = RefCell::new(Vec::new());
+            let helper_leaves = RefCell::new(0);
+            let notifications = RefCell::new(Vec::new());
+
+            let effect = run_file_drop_dispatch(
+                &dispatch,
+                true,
+                Some(token),
+                DROPEFFECT_MOVE,
+                || {
+                    Some((
+                        ExternalPaths([PathBuf::from("replacement.txt")].into_iter().collect()),
+                        Some(token),
+                    ))
+                },
+                |context| {
+                    assert_eq!(
+                        context.paths.as_ref().unwrap().paths()[0],
+                        PathBuf::from("replacement.txt")
+                    );
+                    context.response.set_effect(gpui::FileDropEffect::Move);
+                    if !reenter_in_helper {
+                        assert!(dispatch.enter(true).is_none());
+                    }
+                    true
+                },
+                |effect| {
+                    helper_effects.borrow_mut().push(effect.0);
+                    if reenter_in_helper {
+                        assert!(dispatch.enter(true).is_none());
+                    }
+                },
+                || *helper_leaves.borrow_mut() += 1,
+                |event| {
+                    notifications.borrow_mut().push(match event {
+                        FileDropEvent::Exited => "exited",
+                        FileDropEvent::Ended => "ended",
+                        _ => "unexpected",
+                    });
+                },
+            );
+
+            assert_eq!(effect, DROPEFFECT_MOVE);
+            assert_eq!(helper_effects.into_inner(), [DROPEFFECT_MOVE.0]);
+            assert_eq!(
+                helper_leaves.into_inner(),
+                if reenter_in_helper { 1 } else { 0 }
+            );
+            assert_eq!(notifications.into_inner(), ["exited", "ended"]);
+        }
+    }
 
     #[test]
     fn test_double_click_interval() {
