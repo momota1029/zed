@@ -1310,6 +1310,9 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 self.local_drag_session.set(None);
                 *pdweffect = DROPEFFECT_NONE;
             }
+            if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
+                eprintln!("[file-drop] IDropTargetHelper::DragEnter begin");
+            }
             let helper_result = self.window.drop_target_helper.DragEnter(
                 self.window.hwnd,
                 idata_obj,
