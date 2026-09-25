@@ -1145,6 +1145,7 @@ struct WindowsDragDropHandler {
     local_drag_session: Cell<Option<LocalDragSessionToken>>,
     supports_file_drop: Cell<bool>,
     callback_dispatch: FileDropEventDispatch,
+    last_drag_over_trace: Cell<Option<(bool, bool, u32)>>,
 }
 
 #[derive(Default)]
@@ -1183,6 +1184,35 @@ impl FileDropEventDispatch {
 }
 
 impl WindowsDragDropHandler {
+    fn trace_drag_over(
+        &self,
+        allowed_effects: DROPEFFECT,
+        returned_effect: DROPEFFECT,
+        helper_effect: DROPEFFECT,
+        supports_file_drop: bool,
+        callback_present: bool,
+        reentered: bool,
+        terminal: bool,
+        helper_result: &str,
+        helper_leave_result: Option<&str>,
+    ) {
+        if std::env::var_os("GPUI_FILE_DROP_TRACE").is_none() {
+            return;
+        }
+
+        let state = (callback_present, supports_file_drop, returned_effect.0);
+        let transitioned = self.last_drag_over_trace.replace(Some(state)) != Some(state);
+        if reentered || transitioned {
+            eprintln!(
+                "[file-drop] DragOver callback={callback_present} supports={supports_file_drop} allowed={} helper_effect={} returned={} reentered={reentered} terminal={terminal} helper={helper_result} helper_leave={}",
+                allowed_effects.0,
+                helper_effect.0,
+                returned_effect.0,
+                helper_leave_result.unwrap_or("not-called"),
+            );
+        }
+    }
+
     fn handle_drag_drop(&self, input: PlatformInput, context: FileDropContext) -> bool {
         let Some(mut func) = self.window.state.callbacks.input.take() else {
             return false;
@@ -1222,9 +1252,19 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let Some(_event_guard) = self.callback_dispatch.enter(false) else {
+            let allowed_effects = unsafe { *pdweffect };
             unsafe { *pdweffect = DROPEFFECT_NONE };
+            if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
+                eprintln!(
+                    "[file-drop] DragEnter callback=false supports={} allowed={} returned=0 reentered=true terminal={} helper=not-called",
+                    self.supports_file_drop.get(),
+                    allowed_effects.0,
+                    self.callback_dispatch.terminal_requested.get(),
+                );
+            }
             return Ok(());
         };
+        self.last_drag_over_trace.set(None);
         unsafe {
             let allowed_effects = *pdweffect;
             *pdweffect = DROPEFFECT_NONE;
@@ -1232,6 +1272,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             self.local_drag_session.set(None);
             let idata_obj = pdataobj.ok()?;
             let screen_position = POINT { x: pt.x, y: pt.y };
+            let mut callback_present = false;
             if let Some(paths) = read_file_drop_paths(idata_obj) {
                 self.supports_file_drop.set(true);
                 self.local_drag_session
@@ -1250,7 +1291,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                     ),
                     paths: paths.clone(),
                 });
-                let callback_present = self.handle_drag_drop(
+                callback_present = self.handle_drag_drop(
                     input,
                     FileDropContext {
                         local_drag_session: self.local_drag_session.get(),
@@ -1269,16 +1310,35 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 self.local_drag_session.set(None);
                 *pdweffect = DROPEFFECT_NONE;
             }
-            self.window
-                .drop_target_helper
-                .DragEnter(self.window.hwnd, idata_obj, &screen_position, *pdweffect)
-                .log_err();
+            let helper_result = self.window.drop_target_helper.DragEnter(
+                self.window.hwnd,
+                idata_obj,
+                &screen_position,
+                *pdweffect,
+            );
+            let trace_enabled = std::env::var_os("GPUI_FILE_DROP_TRACE").is_some();
+            let helper_status = trace_enabled.then(|| format!("{helper_result:?}"));
+            helper_result.log_err();
             let (reentered, terminal) = self.callback_dispatch.take_reentry();
+            let supports_before_reentry = self.supports_file_drop.get();
+            let mut helper_leave_status = None;
             if reentered {
-                let had_session = self.supports_file_drop.get();
                 *pdweffect = DROPEFFECT_NONE;
-                self.window.drop_target_helper.DragLeave().log_err();
-                self.finish_reentered_event(had_session, terminal);
+                let leave_result = self.window.drop_target_helper.DragLeave();
+                helper_leave_status = trace_enabled.then(|| format!("{leave_result:?}"));
+                leave_result.log_err();
+                self.finish_reentered_event(supports_before_reentry, terminal);
+            }
+            if trace_enabled {
+                eprintln!(
+                    "[file-drop] DragEnter callback={callback_present} supports_before_reentry={} supports_after={} allowed={} returned={} reentered={reentered} terminal={terminal} helper={} helper_leave={}",
+                    supports_before_reentry,
+                    self.supports_file_drop.get(),
+                    allowed_effects.0,
+                    (*pdweffect).0,
+                    helper_status.as_deref().unwrap_or("unavailable"),
+                    helper_leave_status.as_deref().unwrap_or("not-called"),
+                );
             }
         }
         Ok(())
@@ -1291,7 +1351,16 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let Some(_event_guard) = self.callback_dispatch.enter(false) else {
+            let allowed_effects = unsafe { *pdweffect };
             unsafe { *pdweffect = DROPEFFECT_NONE };
+            if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
+                eprintln!(
+                    "[file-drop] DragOver callback=false supports={} allowed={} returned=0 reentered=true terminal={} helper=not-called",
+                    self.supports_file_drop.get(),
+                    allowed_effects.0,
+                    self.callback_dispatch.terminal_requested.get(),
+                );
+            }
             return Ok(());
         };
         let screen_position = POINT { x: pt.x, y: pt.y };
@@ -1301,17 +1370,30 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             *pdweffect = DROPEFFECT_NONE;
         }
         if !self.supports_file_drop.get() {
-            unsafe {
+            let helper_result = unsafe {
                 self.window
                     .drop_target_helper
                     .DragOver(&screen_position, DROPEFFECT_NONE)
-                    .log_err();
-            }
+            };
+            let trace_enabled = std::env::var_os("GPUI_FILE_DROP_TRACE").is_some();
+            let helper_status = trace_enabled.then(|| format!("{helper_result:?}"));
+            helper_result.log_err();
             let (reentered, terminal) = self.callback_dispatch.take_reentry();
             if reentered {
                 unsafe { *pdweffect = DROPEFFECT_NONE };
                 self.finish_reentered_event(false, terminal);
             }
+            self.trace_drag_over(
+                allowed_effects,
+                unsafe { *pdweffect },
+                DROPEFFECT_NONE,
+                false,
+                false,
+                reentered,
+                terminal,
+                helper_status.as_deref().unwrap_or("unavailable"),
+                None,
+            );
             return Ok(());
         }
         unsafe {
@@ -1336,43 +1418,77 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 response: response.clone(),
             },
         );
-        unsafe {
+        let helper_effect = unsafe {
             *pdweffect = resolve_drop_effect(
                 response.effect(),
                 callback_present,
                 self.supports_file_drop.get(),
                 allowed_effects,
             );
+            *pdweffect
+        };
+        let helper_result = unsafe {
             self.window
                 .drop_target_helper
-                .DragOver(&screen_position, *pdweffect)
-                .log_err();
-        }
+                .DragOver(&screen_position, helper_effect)
+        };
+        let trace_enabled = std::env::var_os("GPUI_FILE_DROP_TRACE").is_some();
+        let helper_status = trace_enabled.then(|| format!("{helper_result:?}"));
+        helper_result.log_err();
+        let supports_before_reentry = self.supports_file_drop.get();
         let (reentered, terminal) = self.callback_dispatch.take_reentry();
+        let mut helper_leave_status = None;
         if reentered {
             let had_session = self.supports_file_drop.get();
             unsafe {
                 *pdweffect = DROPEFFECT_NONE;
-                self.window.drop_target_helper.DragLeave().log_err();
             }
+            let leave_result = unsafe { self.window.drop_target_helper.DragLeave() };
+            helper_leave_status = trace_enabled.then(|| format!("{leave_result:?}"));
+            leave_result.log_err();
             self.finish_reentered_event(had_session, terminal);
         }
+        self.trace_drag_over(
+            allowed_effects,
+            unsafe { *pdweffect },
+            helper_effect,
+            supports_before_reentry,
+            callback_present,
+            reentered,
+            terminal,
+            helper_status.as_deref().unwrap_or("unavailable"),
+            helper_leave_status.as_deref(),
+        );
 
         Ok(())
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
         let Some(_event_guard) = self.callback_dispatch.enter(true) else {
+            if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
+                eprintln!(
+                    "[file-drop] DragLeave callback=false supports={} allowed=unknown returned=unknown reentered=true terminal=true helper=not-called",
+                    self.supports_file_drop.get(),
+                );
+            }
             return Ok(());
         };
-        unsafe {
-            self.window.drop_target_helper.DragLeave().log_err();
-        }
+        let helper_result = unsafe { self.window.drop_target_helper.DragLeave() };
+        let trace_enabled = std::env::var_os("GPUI_FILE_DROP_TRACE").is_some();
+        let helper_status = trace_enabled.then(|| format!("{helper_result:?}"));
+        helper_result.log_err();
         let input = PlatformInput::FileDrop(FileDropEvent::Exited);
-        self.handle_drag_drop(input, FileDropContext::default());
+        let callback_present = self.handle_drag_drop(input, FileDropContext::default());
         self.supports_file_drop.set(false);
         self.local_drag_session.set(None);
         let (reentered, terminal) = self.callback_dispatch.take_reentry();
+        if trace_enabled {
+            eprintln!(
+                "[file-drop] DragLeave callback={callback_present} supports=false allowed=none returned=none reentered={reentered} terminal={terminal} helper={}",
+                helper_status.as_deref().unwrap_or("unavailable"),
+            );
+        }
+        self.last_drag_over_trace.set(None);
         if reentered {
             self.finish_reentered_event(false, terminal);
         }
@@ -1904,6 +2020,7 @@ fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
         local_drag_session: Cell::new(None),
         supports_file_drop: Cell::new(false),
         callback_dispatch: FileDropEventDispatch::default(),
+        last_drag_over_trace: Cell::new(None),
     };
     // The lifetime of `IDropTarget` is handled by Windows, it won't release until
     // we call `RevokeDragDrop`.
