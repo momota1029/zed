@@ -10,6 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn file_drop_trace_time_micros() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_micros())
+}
+
 use anyhow::{Context as _, Result};
 use futures::channel::oneshot::{self, Receiver};
 use gpui_util::ResultExt;
@@ -1204,7 +1210,8 @@ impl WindowsDragDropHandler {
         let transitioned = self.last_drag_over_trace.replace(Some(state)) != Some(state);
         if reentered || transitioned {
             eprintln!(
-                "[file-drop] DragOver callback={callback_present} supports={supports_file_drop} allowed={} helper_effect={} returned={} reentered={reentered} terminal={terminal} helper={helper_result} helper_leave={}",
+                "[file-drop] t_us={} DragOver callback={callback_present} supports={supports_file_drop} allowed={} helper_effect={} returned={} reentered={reentered} terminal={terminal} helper={helper_result} helper_leave={}",
+                file_drop_trace_time_micros(),
                 allowed_effects.0,
                 helper_effect.0,
                 returned_effect.0,
@@ -1256,7 +1263,8 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             unsafe { *pdweffect = DROPEFFECT_NONE };
             if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
                 eprintln!(
-                    "[file-drop] DragEnter callback=false supports={} allowed={} returned=0 reentered=true terminal={} helper=not-called",
+                    "[file-drop] t_us={} DragEnter callback=false supports={} allowed={} returned=0 reentered=true terminal={} helper=not-called",
+                    file_drop_trace_time_micros(),
                     self.supports_file_drop.get(),
                     allowed_effects.0,
                     self.callback_dispatch.terminal_requested.get(),
@@ -1311,7 +1319,10 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 *pdweffect = DROPEFFECT_NONE;
             }
             if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
-                eprintln!("[file-drop] IDropTargetHelper::DragEnter begin");
+                eprintln!(
+                    "[file-drop] t_us={} IDropTargetHelper::DragEnter begin",
+                    file_drop_trace_time_micros()
+                );
             }
             let helper_result = self.window.drop_target_helper.DragEnter(
                 self.window.hwnd,
@@ -1334,7 +1345,8 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             }
             if trace_enabled {
                 eprintln!(
-                    "[file-drop] DragEnter callback={callback_present} supports_before_reentry={} supports_after={} allowed={} returned={} reentered={reentered} terminal={terminal} helper={} helper_leave={}",
+                    "[file-drop] t_us={} DragEnter callback={callback_present} supports_before_reentry={} supports_after={} allowed={} returned={} reentered={reentered} terminal={terminal} helper={} helper_leave={}",
+                    file_drop_trace_time_micros(),
                     supports_before_reentry,
                     self.supports_file_drop.get(),
                     allowed_effects.0,
@@ -1358,7 +1370,8 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             unsafe { *pdweffect = DROPEFFECT_NONE };
             if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
                 eprintln!(
-                    "[file-drop] DragOver callback=false supports={} allowed={} returned=0 reentered=true terminal={} helper=not-called",
+                    "[file-drop] t_us={} DragOver callback=false supports={} allowed={} returned=0 reentered=true terminal={} helper=not-called",
+                    file_drop_trace_time_micros(),
                     self.supports_file_drop.get(),
                     allowed_effects.0,
                     self.callback_dispatch.terminal_requested.get(),
@@ -1470,7 +1483,8 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         let Some(_event_guard) = self.callback_dispatch.enter(true) else {
             if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
                 eprintln!(
-                    "[file-drop] DragLeave callback=false supports={} allowed=unknown returned=unknown reentered=true terminal=true helper=not-called",
+                    "[file-drop] t_us={} DragLeave callback=false supports={} allowed=unknown returned=unknown reentered=true terminal=true helper=not-called",
+                    file_drop_trace_time_micros(),
                     self.supports_file_drop.get(),
                 );
             }
@@ -1487,7 +1501,8 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         let (reentered, terminal) = self.callback_dispatch.take_reentry();
         if trace_enabled {
             eprintln!(
-                "[file-drop] DragLeave callback={callback_present} supports=false allowed=none returned=none reentered={reentered} terminal={terminal} helper={}",
+                "[file-drop] t_us={} DragLeave callback={callback_present} supports=false allowed=none returned=none reentered={reentered} terminal={terminal} helper={}",
+                file_drop_trace_time_micros(),
                 helper_status.as_deref().unwrap_or("unavailable"),
             );
         }
