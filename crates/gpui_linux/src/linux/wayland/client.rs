@@ -2355,6 +2355,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
 
                         if let Some(window) = state.mouse_focused_window.clone() {
                             let input = PlatformInput::MouseDown(MouseDownEvent {
+                                source: gpui::MouseInputSource::Mouse,
                                 button,
                                 position: state.mouse_location.unwrap(),
                                 modifiers: state.modifiers,

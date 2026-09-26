@@ -27,7 +27,7 @@
 use crate::{
     AnyWindowHandle, App, AppCell, AppContext, AsyncApp, BackgroundExecutor, BorrowAppContext,
     Bounds, ClipboardItem, Context, Entity, ForegroundExecutor, Global, InputEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Platform,
+    MouseButton, MouseDownEvent, MouseInputSource, MouseMoveEvent, MouseUpEvent, Pixels, Platform,
     PlatformTextSystem, Point, Render, Size, Task, TestDispatcher, TestPlatform, TextSystem,
     Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
 };
@@ -420,6 +420,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
     /// Simulate a mouse down event.
     pub fn simulate_mouse_down(&mut self, position: Point<Pixels>, button: MouseButton) {
         self.simulate_event(MouseDownEvent {
+            source: MouseInputSource::Mouse,
             position,
             button,
             modifiers: Default::default(),

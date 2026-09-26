@@ -21,10 +21,10 @@ use crate::{
     FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
     InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
     KeyboardClickEvent, LayoutId, LongPressEvent, ModifiersChangedEvent, MouseButton,
-    MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
-    MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
-    TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseInputSource, MouseMoveEvent,
+    MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels,
+    Point, Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
+    TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -649,6 +649,22 @@ impl Interactivity {
         T: 'static,
         W: 'static + Render,
     {
+        self.on_drag_with_threshold_when(value, threshold, |_| true, constructor);
+    }
+
+    /// Registers a drag whose start may be limited using the exact pointer-down event.
+    /// The predicate runs before the listener is consumed or an active drag is created.
+    pub fn on_drag_with_threshold_when<T, W>(
+        &mut self,
+        value: T,
+        threshold: Pixels,
+        can_start: impl Fn(&MouseDownEvent) -> bool + 'static,
+        constructor: impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> Entity<W> + 'static,
+    ) where
+        Self: Sized,
+        T: 'static,
+        W: 'static + Render,
+    {
         debug_assert!(
             self.drag_listener.is_none(),
             "calling on_drag more than once on the same element is not supported"
@@ -656,6 +672,7 @@ impl Interactivity {
         self.drag_listener = Some(DragListener {
             value: Arc::new(value),
             threshold: threshold.as_f32().max(0.0) as f64,
+            can_start: Box::new(can_start),
             render: Box::new(move |value, offset, window, cx| {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
             }),
@@ -1667,6 +1684,24 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Registers a drag with a start predicate evaluated against its pointer-down event.
+    fn on_drag_with_threshold_when<T, W>(
+        mut self,
+        value: T,
+        threshold: Pixels,
+        can_start: impl Fn(&MouseDownEvent) -> bool + 'static,
+        constructor: impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> Entity<W> + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+        T: 'static,
+        W: 'static + Render,
+    {
+        self.interactivity()
+            .on_drag_with_threshold_when(value, threshold, can_start, constructor);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -1798,6 +1833,7 @@ impl HoverListenerMode {
 pub(crate) struct DragListener {
     value: Arc<dyn Any>,
     threshold: f64,
+    can_start: Box<dyn Fn(&MouseDownEvent) -> bool + 'static>,
     render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
     external_payload: Option<ExternalDragPayloadResolver>,
 }
@@ -3022,7 +3058,7 @@ impl Interactivity {
                                     mouse_down.position,
                                     event.position,
                                     listener.threshold,
-                                )
+                                ) && (listener.can_start)(&mouse_down)
                             })
                             && let Some(listener) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
@@ -4805,6 +4841,7 @@ mod tests {
         cx.update_window(any_window, |_, window, cx| {
             window.dispatch_event(
                 MouseDownEvent {
+                    source: MouseInputSource::Mouse,
                     position: mouse_position,
                     button: MouseButton::Left,
                     modifiers: Default::default(),
@@ -5273,6 +5310,7 @@ mod tests {
                 .update_window(any_window, |_, window, cx| {
                     window.dispatch_event(
                         MouseDownEvent {
+                            source: MouseInputSource::Mouse,
                             position: point(px(75.), px(75.)),
                             button: MouseButton::Left,
                             modifiers: Default::default(),

@@ -1204,6 +1204,7 @@ impl X11Client {
 
                         drop(state);
                         window.handle_input(PlatformInput::MouseDown(gpui::MouseDownEvent {
+                            source: gpui::MouseInputSource::Mouse,
                             button,
                             position,
                             modifiers,

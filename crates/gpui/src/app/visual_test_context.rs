@@ -1,9 +1,9 @@
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetSource, BackgroundExecutor,
     Bounds, ClipboardItem, Context, Entity, EntityId, ForegroundExecutor, Global, InputEvent,
-    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Platform, Point, Render, Result, Size, Task, TestDispatcher, TextSystem, VisualTestPlatform,
-    Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
+    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseInputSource, MouseMoveEvent,
+    MouseUpEvent, Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TextSystem,
+    VisualTestPlatform, Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
 };
 use anyhow::anyhow;
 use image::RgbaImage;
@@ -282,6 +282,7 @@ impl VisualTestAppContext {
         self.simulate_event(
             window,
             MouseDownEvent {
+                source: MouseInputSource::Mouse,
                 position,
                 modifiers,
                 button,

@@ -19,8 +19,8 @@ use smallvec::SmallVec;
 
 use crate::{
     Axis, GestureEvent, InputEvent, IsZero, Modifiers, MouseButton, MouseDownEvent, MouseEvent,
-    MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId,
-    TouchPhase, point, px, seal::Sealed,
+    MouseInputSource, MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
+    TouchEvent, TouchId, TouchPhase, point, px, seal::Sealed,
 };
 
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
@@ -771,6 +771,7 @@ impl TouchGestureRecognizer {
                     });
                     recognized.push(RecognizedTouchGesture::Tap {
                         down: MouseDownEvent {
+                            source: MouseInputSource::Touch,
                             button: MouseButton::Left,
                             position: event.position,
                             modifiers: Modifiers::default(),

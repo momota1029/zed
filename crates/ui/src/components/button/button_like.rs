@@ -1,8 +1,8 @@
 use documented::Documented;
 use gpui::{
     AnyElement, AnyView, ClickEvent, CursorStyle, DefiniteLength, FocusHandle, Hsla, MouseButton,
-    MouseClickEvent, MouseDownEvent, MouseUpEvent, Rems, Role, StyleRefinement, Toggled, relative,
-    transparent_black,
+    MouseClickEvent, MouseDownEvent, MouseInputSource, MouseUpEvent, Rems, Role, StyleRefinement,
+    Toggled, relative, transparent_black,
 };
 use smallvec::SmallVec;
 
@@ -842,6 +842,7 @@ impl RenderOnce for ButtonLike {
                             cx.stop_propagation();
                             let click_event = ClickEvent::Mouse(MouseClickEvent {
                                 down: MouseDownEvent {
+                                    source: MouseInputSource::Mouse,
                                     button: MouseButton::Right,
                                     position: event.position,
                                     modifiers: event.modifiers,

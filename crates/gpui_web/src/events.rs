@@ -3,9 +3,9 @@ use std::{collections::HashMap, rc::Rc};
 use gpui::{
     Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
     Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
-    point, px,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseInputSource, MouseMoveEvent, MouseUpEvent,
+    NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent,
+    TouchId, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -241,6 +241,12 @@ impl WebWindowInner {
             event.prevent_default();
 
             let pointer_type = event.pointer_type();
+            let source = match pointer_type.as_str() {
+                "mouse" => MouseInputSource::Mouse,
+                "touch" => MouseInputSource::Touch,
+                "pen" => MouseInputSource::Pen,
+                _ => MouseInputSource::Unknown,
+            };
             let position = pointer_position_in_element(&event);
             this.gesture_start_visual_viewport_height
                 .set(this.visual_viewport_height());
@@ -298,6 +304,7 @@ impl WebWindowInner {
             }
 
             this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                source,
                 button,
                 position,
                 modifiers,

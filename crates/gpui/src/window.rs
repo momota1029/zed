@@ -6752,6 +6752,7 @@ impl Window {
                 if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
                     let center = bounds.center();
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
+                        source: crate::MouseInputSource::Unknown,
                         button: MouseButton::Left,
                         position: center,
                         modifiers: Modifiers::default(),
@@ -8192,6 +8193,7 @@ mod tests {
                 window.draw(cx).clear(cx);
                 window.dispatch_event(
                     MouseDownEvent {
+                        source: crate::MouseInputSource::Mouse,
                         position: point(px(10.), px(10.)),
                         button: MouseButton::Left,
                         modifiers: Default::default(),

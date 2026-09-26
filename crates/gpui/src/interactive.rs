@@ -252,6 +252,9 @@ impl InputEvent for TouchEvent {
 /// A mouse down event from the platform
 #[derive(Clone, Debug, Default)]
 pub struct MouseDownEvent {
+    /// The device that produced this mouse-compatible press.
+    pub source: MouseInputSource,
+
     /// Which mouse button was pressed.
     pub button: MouseButton,
 
@@ -266,6 +269,20 @@ pub struct MouseDownEvent {
 
     /// Whether this is the first, focusing click.
     pub first_mouse: bool,
+}
+
+/// Identifies the source of a mouse-compatible press without exposing platform types to GPUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MouseInputSource {
+    /// A native mouse press, or a backend that does not expose pointer provenance.
+    #[default]
+    Mouse,
+    /// A touch contact represented by a mouse-compatible press.
+    Touch,
+    /// A pen contact represented by a mouse-compatible press.
+    Pen,
+    /// The origin is unavailable, ambiguous, or synthetic.
+    Unknown,
 }
 
 impl Sealed for MouseDownEvent {}

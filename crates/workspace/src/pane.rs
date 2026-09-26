@@ -6840,6 +6840,7 @@ mod tests {
             .expect("Tab C (index 2) should have debug bounds");
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: tab_a_bounds.center(),
             button: MouseButton::Left,
             modifiers: Modifiers::default(),
@@ -6915,6 +6916,7 @@ mod tests {
             .expect("Tab C (index 2) should have debug bounds");
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: tab_a_bounds.center(),
             button: MouseButton::Left,
             modifiers: Modifiers::default(),
@@ -6967,6 +6969,7 @@ mod tests {
             .expect("Tab C (index 2) should have debug bounds");
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: tab_a_bounds.center(),
             button: MouseButton::Left,
             modifiers: Modifiers::default(),
@@ -7034,6 +7037,7 @@ mod tests {
             .expect("Tab E (index 4) should have debug bounds");
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: tab_c_bounds.center(),
             button: MouseButton::Left,
             modifiers: Modifiers::default(),
@@ -7089,6 +7093,7 @@ mod tests {
             .expect("Tab B (index 2) should have debug bounds");
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: tab_a_bounds.center(),
             button: MouseButton::Middle,
             modifiers: Modifiers::default(),
@@ -7108,6 +7113,7 @@ mod tests {
         cx.run_until_parked();
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: tab_b_bounds.center(),
             button: MouseButton::Middle,
             modifiers: Modifiers::default(),
@@ -7171,6 +7177,7 @@ mod tests {
             .expect("pinned_tabs_border should have debug bounds");
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: pinned_drop_target_bounds.center(),
             button: MouseButton::Left,
             modifiers: Modifiers::default(),

@@ -7128,6 +7128,7 @@ async fn test_right_click_menu_behind_collab_panel(cx: &mut TestAppContext) {
     let new_tab_button_bounds = cx.debug_bounds("ICON-Plus").unwrap();
 
     cx.simulate_event(MouseDownEvent {
+        source: gpui::MouseInputSource::Mouse,
         button: MouseButton::Right,
         position: new_tab_button_bounds.center(),
         modifiers: Modifiers::default(),
@@ -7140,6 +7141,7 @@ async fn test_right_click_menu_behind_collab_panel(cx: &mut TestAppContext) {
 
     let tab_bounds = cx.debug_bounds("TAB-1").unwrap();
     cx.simulate_event(MouseDownEvent {
+        source: gpui::MouseInputSource::Mouse,
         button: MouseButton::Right,
         position: tab_bounds.center(),
         modifiers: Modifiers::default(),

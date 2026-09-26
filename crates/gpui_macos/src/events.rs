@@ -1,8 +1,8 @@
 use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
-    NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    MouseDownEvent, MouseExitEvent, MouseInputSource, MouseMoveEvent, MousePressureEvent,
+    MouseUpEvent, NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 
 use crate::{
@@ -150,6 +150,7 @@ pub(crate) unsafe fn platform_input_from_native(
                 };
                 window_height.map(|window_height| {
                     PlatformInput::MouseDown(MouseDownEvent {
+                        source: MouseInputSource::Mouse,
                         button,
                         position: point(
                             px(native_event.locationInWindow().x as f32),
@@ -221,6 +222,7 @@ pub(crate) unsafe fn platform_input_from_native(
                 match navigation_direction {
                     Some(direction) => window_height.map(|window_height| {
                         PlatformInput::MouseDown(MouseDownEvent {
+                            source: MouseInputSource::Mouse,
                             button: MouseButton::Navigate(direction),
                             position: point(
                                 px(native_event.locationInWindow().x as f32),

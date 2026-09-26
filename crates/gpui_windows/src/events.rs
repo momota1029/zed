@@ -112,11 +112,20 @@ struct DrawWindowGuard<'a> {
 const MI_WP_SIGNATURE_MASK: usize = 0xffff_ff00;
 const MI_WP_SIGNATURE: usize = 0xff51_5700;
 const MI_WP_FLAG_TOUCH: usize = 0x80;
+const MI_WP_FLAG_PEN: usize = 0x40;
 const PROMOTED_TOUCH_DOUBLE_CLICK_SLOP_LOGICAL: f32 = 16.0;
 
-fn is_touch_promoted_mouse_message() -> bool {
+fn mouse_input_source_from_message() -> MouseInputSource {
     let extra_info = unsafe { GetMessageExtraInfo().0 as usize };
-    (extra_info & MI_WP_SIGNATURE_MASK) == MI_WP_SIGNATURE && (extra_info & MI_WP_FLAG_TOUCH) != 0
+    if (extra_info & MI_WP_SIGNATURE_MASK) != MI_WP_SIGNATURE {
+        return MouseInputSource::Mouse;
+    }
+
+    match extra_info & (MI_WP_FLAG_TOUCH | MI_WP_FLAG_PEN) {
+        MI_WP_FLAG_TOUCH => MouseInputSource::Touch,
+        MI_WP_FLAG_PEN => MouseInputSource::Pen,
+        _ => MouseInputSource::Unknown,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -792,7 +801,8 @@ impl WindowsWindowInner {
         let y = lparam.signed_hiword();
         let physical_point = point(DevicePixels(x as i32), DevicePixels(y as i32));
         let scale_factor = self.state.scale_factor.get();
-        let click_count = if button == MouseButton::Left && is_touch_promoted_mouse_message() {
+        let source = mouse_input_source_from_message();
+        let click_count = if button == MouseButton::Left && source == MouseInputSource::Touch {
             let touch_slop =
                 (PROMOTED_TOUCH_DOUBLE_CLICK_SLOP_LOGICAL * scale_factor).ceil() as i32;
             self.state
@@ -803,6 +813,7 @@ impl WindowsWindowInner {
         };
 
         let input = PlatformInput::MouseDown(MouseDownEvent {
+            source,
             button,
             position: logical_point(x as f32, y as f32, scale_factor),
             modifiers: current_modifiers(),
@@ -834,8 +845,10 @@ impl WindowsWindowInner {
             .click_state
             .update_system_double_click(button, physical_point);
         let scale_factor = self.state.scale_factor.get();
+        let source = mouse_input_source_from_message();
 
         let input = PlatformInput::MouseDown(MouseDownEvent {
+            source,
             button,
             position: logical_point(x as f32, y as f32, scale_factor),
             modifiers: current_modifiers(),
@@ -1404,6 +1417,7 @@ impl WindowsWindowInner {
             let click_count = self.state.click_state.update(button, physical_point);
 
             let input = PlatformInput::MouseDown(MouseDownEvent {
+                source: MouseInputSource::Mouse,
                 button,
                 position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
                 modifiers: current_modifiers(),

@@ -1888,6 +1888,7 @@ mod tests {
             "});
 
         cx.simulate_event(MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             position: hover_point,
             modifiers: Modifiers::none(),
             button: MouseButton::Left,

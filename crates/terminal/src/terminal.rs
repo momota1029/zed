@@ -3913,6 +3913,7 @@ mod tests {
         cx: &mut Context<Terminal>,
     ) {
         let mouse_down = MouseDownEvent {
+            source: gpui::MouseInputSource::Mouse,
             button: MouseButton::Left,
             position,
             modifiers: Modifiers::none(),
@@ -4018,6 +4019,7 @@ mod tests {
             };
             terminal.mouse_down(
                 &MouseDownEvent {
+                    source: gpui::MouseInputSource::Mouse,
                     button: MouseButton::Left,
                     position: point(px(50.0), px(10.0)),
                     modifiers: shift,
@@ -4077,6 +4079,7 @@ mod tests {
 
             terminal.mouse_down(
                 &MouseDownEvent {
+                    source: gpui::MouseInputSource::Mouse,
                     button: MouseButton::Left,
                     position: point(px(90.0), px(10.0)),
                     modifiers: Modifiers {
@@ -4808,6 +4811,7 @@ mod tests {
             cx: &mut Context<Terminal>,
         ) {
             let mouse_down = MouseDownEvent {
+                source: gpui::MouseInputSource::Mouse,
                 button: MouseButton::Left,
                 position,
                 modifiers: Modifiers::secondary_key(),
