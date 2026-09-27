@@ -5705,7 +5705,6 @@ impl Window {
                             cx.active_drag.take();
                             self.refresh();
                         }
-                        crate::TouchPhase::Started => {}
                     }
                 }
             }

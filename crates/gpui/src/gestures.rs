@@ -970,6 +970,7 @@ impl TouchGestureRecognizer {
         };
     }
 
+    #[cfg(test)]
     pub(crate) fn offer_touch_drag(&mut self, id: TouchId) -> Option<RecognizedTouchGesture> {
         let TouchGestureState::Pending {
             touch,

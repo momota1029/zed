@@ -707,9 +707,11 @@ impl Interactivity {
         listener.touch_candidate = Some(Rc::new(|_, _, _| true));
     }
 
-    /// Enables touch drag after a synchronous pointer-down callback accepts the contact.
-    /// The callback may snapshot application state for the potential drag, but must not start
-    /// the visual drag; GPUI starts it only after movement crosses touch slop.
+    /// Enables touch drag when a synchronous pointer-down callback accepts the drag candidate.
+    /// A reserved contact remains routed to GPUI even when the callback returns false, so its
+    /// ordinary tap and long-press behavior can continue without starting this drag.
+    /// The callback may snapshot application state but must not start the visual drag; GPUI starts
+    /// it only after movement crosses touch slop.
     pub fn on_touch_drag_when(
         &mut self,
         candidate: impl Fn(&MouseDownEvent, &mut Window, &mut App) -> bool + 'static,
@@ -1763,9 +1765,10 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Enables a typed touch drag when the synchronous pointer-down callback accepts it.
-    /// The callback can snapshot the typed value before touch tap behavior changes application
-    /// selection. It must not start the visual drag; that starts only after touch slop.
+    /// Enables a typed touch drag when the synchronous pointer-down callback accepts the drag
+    /// candidate. A rejected candidate remains routed to GPUI for ordinary tap and long-press
+    /// behavior. The callback can snapshot the typed value before touch tap behavior changes
+    /// application selection; it must not start the visual drag before touch slop.
     fn on_touch_drag_when(
         mut self,
         candidate: impl Fn(&MouseDownEvent, &mut Window, &mut App) -> bool + 'static,
@@ -2742,6 +2745,7 @@ impl Interactivity {
                                             }
 
                                             self.paint_mouse_listeners(
+                                                global_id,
                                                 hitbox,
                                                 element_state.as_mut(),
                                                 window,
@@ -2912,6 +2916,7 @@ impl Interactivity {
 
     fn paint_mouse_listeners(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         hitbox: &Hitbox,
         element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
@@ -3076,10 +3081,7 @@ impl Interactivity {
         if !drop_listeners.is_empty() {
             let hitbox = hitbox.clone();
             window.on_mouse_event({
-                move |event: &dyn Any, phase, window, cx| {
-                    if event.downcast_ref::<MouseUpEvent>().is_none() {
-                        return;
-                    }
+                move |_: &MouseUpEvent, phase, window, cx| {
                     if let Some(drag) = &cx.active_drag
                         && phase == DispatchPhase::Bubble
                         && hitbox.is_hovered(window)
@@ -3164,7 +3166,6 @@ impl Interactivity {
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let drag_listener = drag_listener.clone();
                     let hitbox = hitbox.clone();
                     let has_aux_click_listeners = !aux_click_listeners.is_empty();
                     move |event: &MouseDownEvent, phase, window, _cx| {
@@ -3180,6 +3181,8 @@ impl Interactivity {
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
+                    let drag_listener = drag_listener.clone();
+                    let clicked_state = clicked_state.clone();
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {

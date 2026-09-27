@@ -240,16 +240,17 @@ pub struct TouchEvent {
     pub predicted_position: Option<Point<Pixels>>,
     /// Normalized touch force in `0.0..=1.0`, if the hardware reports it.
     pub force: Option<f32>,
-    /// True when the platform routed this contact to GPUI because an opted-in
-    /// touch drag target was under the contact at pointer-down.
+    /// True when the contact may become a typed drag after it crosses touch slop.
+    /// A reserved contact can still be routed to GPUI with this set to false so
+    /// ordinary tap and long-press input stays on the same element.
     pub drag_candidate: bool,
-    /// Stable identity of the element that accepted this contact at pointer-down.
-    /// Present only for a platform-routed item drag candidate.
+    /// Stable identity of the element that claimed this contact for GPUI at pointer-down.
+    /// A claimed contact may still be an ordinary tap/pan rather than a drag candidate.
     pub drag_target: Option<crate::GlobalElementId>,
 }
 
 /// A non-mutating hit-test request used by a platform to choose whether a
-/// touch contact belongs to an opted-in typed drag target.
+/// touch contact belongs to GPUI or to a native gesture handler.
 #[derive(Clone, Debug)]
 pub struct TouchDragCandidateProbe {
     position: Point<Pixels>,
@@ -283,13 +284,13 @@ impl TouchDragCandidateProbe {
         true
     }
 
-    /// Accepts or rejects the reserved target after its synchronous contact callback.
+    /// Marks the reserved target as a drag candidate or ordinary GPUI touch target.
     #[doc(hidden)]
     pub fn accept(&self, accepted: bool) {
         self.accepted.set(accepted);
     }
 
-    /// Returns whether an eligible touch drag target claimed the probe.
+    /// Returns whether the reserved target may start a typed drag.
     pub fn is_candidate(&self) -> bool {
         self.accepted.get()
     }
@@ -300,14 +301,19 @@ impl TouchDragCandidateProbe {
         self.target.borrow().is_some()
     }
 
-    /// Returns the one stable element identity that won the hit-tested probe.
+    /// Returns the one stable element identity reserved by the hit-tested probe.
     pub fn target(&self) -> Option<crate::GlobalElementId> {
-        self.accepted
-            .get()
-            .then(|| self.target.borrow().clone())
-            .flatten()
+        self.target.borrow().clone()
     }
 }
+
+impl Sealed for TouchDragCandidateProbe {}
+impl InputEvent for TouchDragCandidateProbe {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::TouchDragCandidateProbe(self)
+    }
+}
+impl MouseEvent for TouchDragCandidateProbe {}
 
 impl Sealed for TouchEvent {}
 impl InputEvent for TouchEvent {
