@@ -2113,6 +2113,10 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+    /// True only when an explicit touch drag target claimed a contact probe.
+    pub touch_drag_candidate: bool,
+    /// The stable target identity for the accepted touch drag candidate.
+    pub touch_drag_target: Option<crate::GlobalElementId>,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -5351,7 +5355,35 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        let touch_drag_candidate_probe = match &event {
+            PlatformInput::TouchDragCandidateProbe(probe) => Some(probe.clone()),
+            _ => None,
+        };
         let event = match event {
+            PlatformInput::TouchDragCandidateProbe(probe) => {
+                #[cfg(any(feature = "inspector", debug_assertions))]
+                let allow_probe = !self.is_inspector_picking(cx);
+                #[cfg(not(any(feature = "inspector", debug_assertions)))]
+                let allow_probe = true;
+                if allow_probe {
+                    let previous_mouse_position =
+                        std::mem::replace(&mut self.mouse_position, probe.position());
+                    let previous_hit_test = std::mem::replace(
+                        &mut self.mouse_hit_test,
+                        self.rendered_frame.hit_test(probe.position()),
+                    );
+                    let previous_propagate = cx.propagate_event;
+                    let previous_default_prevented = self.default_prevented;
+                    cx.propagate_event = true;
+                    self.default_prevented = false;
+                    self.dispatch_mouse_event(&probe, cx);
+                    self.mouse_position = previous_mouse_position;
+                    self.mouse_hit_test = previous_hit_test;
+                    cx.propagate_event = previous_propagate;
+                    self.default_prevented = previous_default_prevented;
+                }
+                PlatformInput::TouchDragCandidateProbe(probe)
+            }
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
             PlatformInput::MouseMove(mouse_move) => {
@@ -5404,6 +5436,7 @@ impl Window {
                             cursor_offset: position,
                             cursor_style: None,
                             external_payload_source: None,
+                            source: crate::MouseInputSource::Unknown,
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -5497,6 +5530,10 @@ impl Window {
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
+            touch_drag_candidate: touch_drag_candidate_probe
+                .as_ref()
+                .is_some_and(|probe| probe.is_candidate()),
+            touch_drag_target: touch_drag_candidate_probe.and_then(|probe| probe.target()),
         }
     }
 
@@ -5507,6 +5544,13 @@ impl Window {
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
+        if !cx
+            .active_drag
+            .as_ref()
+            .is_some_and(|drag| drag.source == crate::MouseInputSource::Mouse)
+        {
+            return;
+        }
         let PlatformInput::MouseMove(mouse_move) = event else {
             return;
         };
@@ -5560,11 +5604,6 @@ impl Window {
         }
         let recognized_gestures = self.touch_gestures.handle_event(&event);
         if event.phase == crate::TouchPhase::Started
-            && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
-        {
-            self.dispatch_recognized_touch_gesture(touch_drag, cx);
-        }
-        if event.phase == crate::TouchPhase::Started
             && self.touch_gestures.pending_long_press().is_some()
         {
             self.long_press_capture = None;
@@ -5607,14 +5646,67 @@ impl Window {
                 self.dispatch_mouse_event(&up, cx);
             }
             RecognizedTouchGesture::TouchDrag(touch_drag) => {
-                self.mouse_position = touch_drag.start_position;
-                cx.propagate_event = true;
-                self.default_prevented = false;
                 let started = touch_drag.phase == crate::TouchPhase::Started;
+                self.mouse_position = if started {
+                    touch_drag.start_position
+                } else {
+                    touch_drag.position
+                };
+                cx.propagate_event = true;
+                // Resolve the source at the original contact point on Start;
+                // movement is recognized only after touch slop is crossed.
                 self.dispatch_mouse_event(&touch_drag, cx);
                 if started {
-                    self.touch_gestures
-                        .resolve_touch_drag(self.default_prevented);
+                    self.touch_gestures.resolve_touch_drag(
+                        cx.active_drag
+                            .as_ref()
+                            .is_some_and(|drag| drag.source == crate::MouseInputSource::Touch),
+                    );
+                }
+                if cx
+                    .active_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.source == crate::MouseInputSource::Touch)
+                {
+                    self.mouse_position = touch_drag.position;
+                    match touch_drag.phase {
+                        crate::TouchPhase::Started | crate::TouchPhase::Moved => {
+                            cx.propagate_event = true;
+                            self.dispatch_mouse_event(
+                                &crate::MouseMoveEvent {
+                                    position: touch_drag.position,
+                                    pressed_button: Some(crate::MouseButton::Left),
+                                    modifiers: self.modifiers,
+                                },
+                                cx,
+                            );
+                        }
+                        crate::TouchPhase::Ended => {
+                            cx.propagate_event = true;
+                            self.dispatch_mouse_event(
+                                &crate::MouseUpEvent {
+                                    button: crate::MouseButton::Left,
+                                    position: touch_drag.position,
+                                    modifiers: self.modifiers,
+                                    click_count: 1,
+                                },
+                                cx,
+                            );
+                            if cx
+                                .active_drag
+                                .as_ref()
+                                .is_some_and(|drag| drag.source == crate::MouseInputSource::Touch)
+                            {
+                                cx.active_drag.take();
+                            }
+                            self.refresh();
+                        }
+                        crate::TouchPhase::Cancelled => {
+                            cx.active_drag.take();
+                            self.refresh();
+                        }
+                        crate::TouchPhase::Started => {}
+                    }
                 }
             }
             RecognizedTouchGesture::LongPress(long_press) => {
@@ -8770,6 +8862,8 @@ mod tests {
                         position: point(px(x), px(0.)),
                         predicted_position: None,
                         force: None,
+                        drag_candidate: false,
+                        drag_target: None,
                     }
                     .to_platform_input(),
                     cx,

@@ -128,15 +128,17 @@ fn mouse_input_source_from_message() -> MouseInputSource {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ActiveTouch {
     id: TouchId,
     position: Point<Pixels>,
+    drag_target: Option<gpui::GlobalElementId>,
 }
 
 #[derive(Default)]
 pub(crate) struct WindowsTouchState {
     active: HashMap<u32, ActiveTouch>,
+    active_contacts: HashSet<u32>,
     claimed: HashSet<u32>,
     next_id: u64,
 }
@@ -146,25 +148,29 @@ impl WindowsTouchState {
         &mut self,
         pointer_id: u32,
         position: Point<Pixels>,
+        drag_target: Option<gpui::GlobalElementId>,
     ) -> Option<(ActiveTouch, Option<ActiveTouch>)> {
         let next_id = self.next_id.checked_add(1)?;
         self.next_id = next_id;
         let touch = ActiveTouch {
             id: TouchId(next_id),
             position,
+            drag_target,
         };
+        self.active_contacts.insert(pointer_id);
         self.claimed.insert(pointer_id);
-        let replaced = self.active.insert(pointer_id, touch);
+        let replaced = self.active.insert(pointer_id, touch.clone());
         Some((touch, replaced))
     }
 
     fn update(&mut self, pointer_id: u32, position: Point<Pixels>) -> Option<ActiveTouch> {
         let touch = self.active.get_mut(&pointer_id)?;
         touch.position = position;
-        Some(*touch)
+        Some(touch.clone())
     }
 
     fn finish(&mut self, pointer_id: u32) -> Option<ActiveTouch> {
+        self.active_contacts.remove(&pointer_id);
         self.claimed.remove(&pointer_id);
         self.active.remove(&pointer_id)
     }
@@ -172,9 +178,24 @@ impl WindowsTouchState {
     fn cancel(&mut self, pointer_id: u32, terminal: bool) -> (Option<ActiveTouch>, bool) {
         let claimed = self.claimed.contains(&pointer_id);
         if terminal {
+            self.active_contacts.remove(&pointer_id);
             self.claimed.remove(&pointer_id);
         }
         (self.active.remove(&pointer_id), claimed)
+    }
+
+    fn mark_native_contact(&mut self, pointer_id: u32) {
+        self.active_contacts.insert(pointer_id);
+    }
+
+    fn finish_native_contact(&mut self, pointer_id: u32) {
+        self.active_contacts.remove(&pointer_id);
+    }
+
+    fn has_other_active_contact(&self, pointer_id: u32) -> bool {
+        self.active_contacts
+            .iter()
+            .any(|active| *active != pointer_id)
     }
 
     fn is_claimed(&self, pointer_id: u32) -> bool {
@@ -272,25 +293,59 @@ impl WindowsWindowInner {
             WM_MOUSEWHEEL => self.handle_mouse_wheel_msg(handle, wparam, lparam),
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
             WM_POINTERDOWN if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Started)
+                self.handle_pointer_msg(handle, wparam, TouchPhase::Started, None)
             }
             WM_POINTERDOWN if self.state.touch_input_mode == TouchInputMode::Native => {
-                // Associate the contact at the documented UI-thread enrollment point, but
-                // leave the original message unconsumed so Windows can retain native tap and
-                // press-and-hold promotion when Direct Manipulation does not claim a pan.
-                self.state.direct_manipulation.on_pointer_down(wparam);
-                None
+                self.handle_native_pointer_down(handle, wparam)
             }
             WM_POINTERUPDATE if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Moved)
+                self.handle_pointer_msg(handle, wparam, TouchPhase::Moved, None)
             }
             WM_POINTERUP if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Ended)
+                self.handle_pointer_msg(handle, wparam, TouchPhase::Ended, None)
+            }
+            WM_POINTERUPDATE | WM_POINTERUP
+                if self.state.touch_input_mode == TouchInputMode::Native
+                    && self
+                        .state
+                        .touch_state
+                        .borrow()
+                        .is_claimed(wparam.loword() as u32) =>
+            {
+                self.handle_pointer_msg(
+                    handle,
+                    wparam,
+                    if msg == WM_POINTERUP {
+                        TouchPhase::Ended
+                    } else {
+                        TouchPhase::Moved
+                    },
+                    None,
+                )
+            }
+            WM_POINTERUP if self.state.touch_input_mode == TouchInputMode::Native => {
+                self.state
+                    .touch_state
+                    .borrow_mut()
+                    .finish_native_contact(wparam.loword() as u32);
+                None
             }
             WM_POINTERCAPTURECHANGED => {
-                if self.state.touch_input_mode == TouchInputMode::RawGpui {
-                    self.handle_pointer_msg(handle, wparam, TouchPhase::Cancelled)
+                if self.state.touch_input_mode == TouchInputMode::RawGpui
+                    || self
+                        .state
+                        .touch_state
+                        .borrow()
+                        .is_claimed(wparam.loword() as u32)
+                {
+                    self.handle_pointer_msg(handle, wparam, TouchPhase::Cancelled, None)
                 } else {
+                    if self.state.touch_input_mode == TouchInputMode::Native {
+                        self.state
+                            .touch_state
+                            .borrow_mut()
+                            .finish_native_contact(wparam.loword() as u32);
+                    }
                     None
                 }
             }
@@ -560,17 +615,92 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_pointer_msg(&self, handle: HWND, wparam: WPARAM, phase: TouchPhase) -> Option<isize> {
+    fn handle_native_pointer_down(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
+        let pointer_id = wparam.loword() as u32;
+        let mut pointer_info = POINTER_INFO::default();
+        if unsafe { GetPointerInfo(pointer_id, &mut pointer_info) }.is_err()
+            || pointer_info.pointerType != PT_TOUCH
+        {
+            self.state.direct_manipulation.on_pointer_down(wparam);
+            return None;
+        }
+
+        let has_other_active_contact = self
+            .state
+            .touch_state
+            .borrow()
+            .has_other_active_contact(pointer_id);
+
+        // A second contact cancels the GPUI-owned item sequence before it can
+        // establish its own route. Pointer ownership itself never transfers.
+        let active_pointers = self
+            .state
+            .touch_state
+            .borrow()
+            .active
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for active_pointer in active_pointers {
+            self.cancel_active_touch(active_pointer, true);
+        }
+
+        if has_other_active_contact {
+            self.state
+                .touch_state
+                .borrow_mut()
+                .mark_native_contact(pointer_id);
+            self.state.direct_manipulation.on_pointer_down(wparam);
+            return None;
+        }
+
+        let Some(position) = self.pointer_position(handle, pointer_info.ptPixelLocationRaw) else {
+            self.state.direct_manipulation.on_pointer_down(wparam);
+            return None;
+        };
+        if let Some(target) = self.dispatch_touch_drag_candidate_probe(position) {
+            self.handle_pointer_msg(handle, wparam, TouchPhase::Started, Some(target))
+        } else {
+            self.state
+                .touch_state
+                .borrow_mut()
+                .mark_native_contact(pointer_id);
+            self.state.direct_manipulation.on_pointer_down(wparam);
+            None
+        }
+    }
+
+    fn dispatch_touch_drag_candidate_probe(
+        &self,
+        position: Point<Pixels>,
+    ) -> Option<gpui::GlobalElementId> {
+        let Some(mut callback) = self.state.callbacks.input.take() else {
+            return None;
+        };
+        let result = callback(PlatformInput::TouchDragCandidateProbe(
+            TouchDragCandidateProbe::new(position),
+        ));
+        self.state.callbacks.input.set(Some(callback));
+        result.touch_drag_target
+    }
+
+    fn handle_pointer_msg(
+        &self,
+        handle: HWND,
+        wparam: WPARAM,
+        phase: TouchPhase,
+        drag_target: Option<gpui::GlobalElementId>,
+    ) -> Option<isize> {
         let pointer_id = wparam.loword() as u32;
         let mut pointer_info = POINTER_INFO::default();
         if let Err(error) = unsafe { GetPointerInfo(pointer_id, &mut pointer_info) } {
             log::error!("failed to get pointer information: {error}");
-            return self.cancel_active_touch(pointer_id, touch_phase_is_terminal(phase));
+            return self.cancel_active_touch(pointer_id, true);
         }
 
         if pointer_info.pointerType != PT_TOUCH {
             if self.state.touch_state.borrow().is_claimed(pointer_id) {
-                return self.cancel_active_touch(pointer_id, touch_phase_is_terminal(phase));
+                return self.cancel_active_touch(pointer_id, true);
             }
             return None;
         }
@@ -621,7 +751,7 @@ impl WindowsWindowInner {
         // Windows adjusts ptPixelLocation with its input prediction. Gesture
         // classification and hit testing must use the unadjusted digitizer point.
         let Some(position) = self.pointer_position(handle, pointer_info.ptPixelLocationRaw) else {
-            return self.cancel_active_touch(pointer_id, touch_phase_is_terminal(phase));
+            return self.cancel_active_touch(pointer_id, true);
         };
         let predicted_position = if phase == TouchPhase::Moved && predict {
             self.pointer_position(handle, pointer_info.ptPixelLocation)
@@ -636,11 +766,11 @@ impl WindowsWindowInner {
         };
         let touch = match phase {
             TouchPhase::Started => {
-                let (touch, replaced) = self
-                    .state
-                    .touch_state
-                    .borrow_mut()
-                    .begin(pointer_id, position)?;
+                let (touch, replaced) = self.state.touch_state.borrow_mut().begin(
+                    pointer_id,
+                    position,
+                    drag_target.clone(),
+                )?;
                 if let Some(replaced) = replaced {
                     self.dispatch_touch(TouchEvent {
                         timestamp: Some(timestamp),
@@ -649,6 +779,8 @@ impl WindowsWindowInner {
                         position: replaced.position,
                         predicted_position: None,
                         force: None,
+                        drag_candidate: false,
+                        drag_target: None,
                     });
                 }
                 Some(touch)
@@ -673,6 +805,8 @@ impl WindowsWindowInner {
             position,
             predicted_position,
             force: None,
+            drag_candidate: touch.drag_target.is_some() && phase == TouchPhase::Started,
+            drag_target: touch.drag_target.clone(),
         });
 
         // Consuming every message in a claimed touch sequence prevents Windows
@@ -706,6 +840,8 @@ impl WindowsWindowInner {
                 position: touch.position,
                 predicted_position: None,
                 force: None,
+                drag_candidate: false,
+                drag_target: touch.drag_target.clone(),
             });
         }
         claimed.then_some(0)
@@ -2152,10 +2288,6 @@ fn notify_frame_changed(handle: HWND) {
         )
         .log_err();
     }
-}
-
-fn touch_phase_is_terminal(phase: TouchPhase) -> bool {
-    matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled)
 }
 
 #[cfg(test)]

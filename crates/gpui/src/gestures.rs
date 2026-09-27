@@ -390,6 +390,8 @@ pub struct TouchDragEvent {
     pub start_position: Point<Pixels>,
     /// The touch's current position.
     pub position: Point<Pixels>,
+    /// The exact element identity selected by the contact-down probe.
+    pub target: Option<crate::GlobalElementId>,
 }
 
 impl Sealed for TouchDragEvent {}
@@ -410,6 +412,8 @@ pub struct LongPressEvent {
     pub start_position: Point<Pixels>,
     /// The touch's current position.
     pub position: Point<Pixels>,
+    /// The exact element identity selected by the contact-down probe, if any.
+    pub target: Option<crate::GlobalElementId>,
 }
 
 impl Default for LongPressEvent {
@@ -418,6 +422,7 @@ impl Default for LongPressEvent {
             phase: TouchPhase::Started,
             start_position: Point::default(),
             position: Point::default(),
+            target: None,
         }
     }
 }
@@ -523,6 +528,7 @@ enum TouchGestureState {
         deadline: Instant,
         long_press_offered: bool,
         touch_drag_offered: bool,
+        drag_candidate: bool,
     },
     /// The touch exceeded `touch_slop`: it is a pan until it ends, and its
     /// movement flows out as scroll events.
@@ -531,11 +537,14 @@ enum TouchGestureState {
         axis: Axis,
     },
     LongPressing(ActiveTouch),
+    /// The start event is being delivered; the window resolves whether its exact target exists.
+    TouchDragStartPending(ActiveTouch),
     TouchDragging(ActiveTouch),
 }
 
 struct ActiveTouch {
     id: TouchId,
+    drag_target: Option<crate::GlobalElementId>,
     start_position: Point<Pixels>,
     /// The latest raw position reported for this touch.
     last_position: Point<Pixels>,
@@ -627,6 +636,7 @@ impl TouchGestureRecognizer {
                     velocity_tracker.push(now, event.position);
                     let touch = ActiveTouch {
                         id: event.id,
+                        drag_target: event.drag_target.clone(),
                         start_position: event.position,
                         last_position: event.position,
                         emitted_position: event.position,
@@ -652,6 +662,7 @@ impl TouchGestureRecognizer {
                             deadline: now + self.tuning.long_press_duration,
                             long_press_offered: false,
                             touch_drag_offered: false,
+                            drag_candidate: event.drag_candidate,
                         };
                     }
                 }
@@ -662,6 +673,7 @@ impl TouchGestureRecognizer {
                     deadline,
                     long_press_offered,
                     touch_drag_offered,
+                    drag_candidate,
                 } if touch.id == event.id => {
                     touch
                         .velocity_tracker
@@ -669,33 +681,44 @@ impl TouchGestureRecognizer {
                     touch.last_position = event.position;
                     let accumulated = event.position - touch.start_position;
                     if accumulated.magnitude() > f64::from(self.tuning.touch_slop) {
-                        // Carry the full movement so far into the first scroll
-                        // step: the content catches up to the finger instead
-                        // of losing the slop distance.
-                        let mut target = event.predicted_position.unwrap_or(event.position);
-                        let axis = dominant_axis(accumulated);
-                        let mut delta = target - touch.start_position;
-                        lock_delta_to_axis(&mut delta, axis);
-                        touch.last_movement = accumulated;
-                        lock_delta_to_axis(&mut touch.last_movement, axis);
-                        if movements_oppose(delta, touch.last_movement) {
-                            target = event.position;
-                            delta = accumulated;
+                        if drag_candidate {
+                            recognized.push(RecognizedTouchGesture::TouchDrag(TouchDragEvent {
+                                phase: TouchPhase::Started,
+                                start_position: touch.start_position,
+                                position: event.position,
+                                target: touch.drag_target.clone(),
+                            }));
+                            self.state = TouchGestureState::TouchDragStartPending(touch);
+                        } else {
+                            // Carry the full movement so far into the first scroll
+                            // step: the content catches up to the finger instead
+                            // of losing the slop distance.
+                            let mut target = event.predicted_position.unwrap_or(event.position);
+                            let axis = dominant_axis(accumulated);
+                            let mut delta = target - touch.start_position;
                             lock_delta_to_axis(&mut delta, axis);
+                            touch.last_movement = accumulated;
+                            lock_delta_to_axis(&mut touch.last_movement, axis);
+                            if movements_oppose(delta, touch.last_movement) {
+                                target = event.position;
+                                delta = accumulated;
+                                lock_delta_to_axis(&mut delta, axis);
+                            }
+                            touch.emitted_position = target;
+                            recognized.push(RecognizedTouchGesture::Scroll(scroll_event(
+                                touch.start_position,
+                                delta,
+                                TouchPhase::Started,
+                            )));
+                            self.state = TouchGestureState::Panning { touch, axis };
                         }
-                        touch.emitted_position = target;
-                        recognized.push(RecognizedTouchGesture::Scroll(scroll_event(
-                            touch.start_position,
-                            delta,
-                            TouchPhase::Started,
-                        )));
-                        self.state = TouchGestureState::Panning { touch, axis };
                     } else {
                         self.state = TouchGestureState::Pending {
                             touch,
                             deadline,
                             long_press_offered,
                             touch_drag_offered,
+                            drag_candidate,
                         };
                     }
                 }
@@ -738,6 +761,7 @@ impl TouchGestureRecognizer {
                         phase: TouchPhase::Moved,
                         start_position: touch.start_position,
                         position: event.position,
+                        target: touch.drag_target.clone(),
                     }));
                     self.state = TouchGestureState::LongPressing(touch);
                 }
@@ -747,6 +771,7 @@ impl TouchGestureRecognizer {
                         phase: TouchPhase::Moved,
                         start_position: touch.start_position,
                         position: event.position,
+                        target: touch.drag_target.clone(),
                     }));
                     self.state = TouchGestureState::TouchDragging(touch);
                 }
@@ -852,6 +877,7 @@ impl TouchGestureRecognizer {
                         phase: TouchPhase::Ended,
                         start_position: touch.start_position,
                         position: event.position,
+                        target: touch.drag_target.clone(),
                     }));
                 }
                 TouchGestureState::TouchDragging(touch) if touch.id == event.id => {
@@ -859,6 +885,7 @@ impl TouchGestureRecognizer {
                         phase: TouchPhase::Ended,
                         start_position: touch.start_position,
                         position: event.position,
+                        target: touch.drag_target.clone(),
                     }));
                 }
                 other => self.state = other,
@@ -877,6 +904,7 @@ impl TouchGestureRecognizer {
                         phase: TouchPhase::Cancelled,
                         start_position: touch.start_position,
                         position: event.position,
+                        target: touch.drag_target.clone(),
                     }));
                 }
                 TouchGestureState::TouchDragging(touch) if touch.id == event.id => {
@@ -884,6 +912,7 @@ impl TouchGestureRecognizer {
                         phase: TouchPhase::Cancelled,
                         start_position: touch.start_position,
                         position: event.position,
+                        target: touch.drag_target.clone(),
                     }));
                 }
                 other => self.state = other,
@@ -922,6 +951,7 @@ impl TouchGestureRecognizer {
             phase: TouchPhase::Started,
             start_position: touch.start_position,
             position: touch.last_position,
+            target: touch.drag_target.clone(),
         }))
     }
 
@@ -957,20 +987,22 @@ impl TouchGestureRecognizer {
             phase: TouchPhase::Started,
             start_position: touch.start_position,
             position: touch.last_position,
+            target: touch.drag_target.clone(),
         }))
     }
 
     pub(crate) fn resolve_touch_drag(&mut self, claimed: bool) {
-        if !claimed {
-            return;
-        }
         let state = mem::replace(&mut self.state, TouchGestureState::Idle);
         self.state = match state {
+            TouchGestureState::TouchDragStartPending(touch) if claimed => {
+                TouchGestureState::TouchDragging(touch)
+            }
+            TouchGestureState::TouchDragStartPending(_) => TouchGestureState::Idle,
             TouchGestureState::Pending {
                 touch,
                 touch_drag_offered: true,
                 ..
-            } => TouchGestureState::TouchDragging(touch),
+            } if claimed => TouchGestureState::TouchDragging(touch),
             other => other,
         };
     }
@@ -2297,6 +2329,8 @@ mod tests {
             position: point(px(x), px(y)),
             predicted_position: None,
             force: None,
+            drag_candidate: false,
+            drag_target: None,
         }
     }
 }

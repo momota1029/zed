@@ -240,6 +240,73 @@ pub struct TouchEvent {
     pub predicted_position: Option<Point<Pixels>>,
     /// Normalized touch force in `0.0..=1.0`, if the hardware reports it.
     pub force: Option<f32>,
+    /// True when the platform routed this contact to GPUI because an opted-in
+    /// touch drag target was under the contact at pointer-down.
+    pub drag_candidate: bool,
+    /// Stable identity of the element that accepted this contact at pointer-down.
+    /// Present only for a platform-routed item drag candidate.
+    pub drag_target: Option<crate::GlobalElementId>,
+}
+
+/// A non-mutating hit-test request used by a platform to choose whether a
+/// touch contact belongs to an opted-in typed drag target.
+#[derive(Clone, Debug)]
+pub struct TouchDragCandidateProbe {
+    position: Point<Pixels>,
+    target: std::rc::Rc<std::cell::RefCell<Option<crate::GlobalElementId>>>,
+    accepted: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl TouchDragCandidateProbe {
+    /// Creates a probe for a touch contact position.
+    pub fn new(position: Point<Pixels>) -> Self {
+        Self {
+            position,
+            target: Default::default(),
+            accepted: Default::default(),
+        }
+    }
+
+    /// Returns the queried position.
+    pub fn position(&self) -> Point<Pixels> {
+        self.position
+    }
+
+    /// Marks this position as an opted-in touch drag target.
+    #[doc(hidden)]
+    pub fn reserve(&self, target: crate::GlobalElementId) -> bool {
+        let mut current = self.target.borrow_mut();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(target);
+        true
+    }
+
+    /// Accepts or rejects the reserved target after its synchronous contact callback.
+    #[doc(hidden)]
+    pub fn accept(&self, accepted: bool) {
+        self.accepted.set(accepted);
+    }
+
+    /// Returns whether an eligible touch drag target claimed the probe.
+    pub fn is_candidate(&self) -> bool {
+        self.accepted.get()
+    }
+
+    /// Returns whether an element has already been selected for this probe.
+    #[doc(hidden)]
+    pub fn is_reserved(&self) -> bool {
+        self.target.borrow().is_some()
+    }
+
+    /// Returns the one stable element identity that won the hit-tested probe.
+    pub fn target(&self) -> Option<crate::GlobalElementId> {
+        self.accepted
+            .get()
+            .then(|| self.target.borrow().clone())
+            .flatten()
+    }
 }
 
 impl Sealed for TouchEvent {}
@@ -920,6 +987,8 @@ pub enum PlatformInput {
     FileDrop(FileDropEvent),
     /// A raw touch event on a touch screen.
     Touch(TouchEvent),
+    /// Probe whether the touch position is an opted-in typed drag target.
+    TouchDragCandidateProbe(TouchDragCandidateProbe),
 }
 
 impl PlatformInput {
@@ -939,6 +1008,7 @@ impl PlatformInput {
             PlatformInput::TouchDrag(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
             PlatformInput::Touch(_) => None,
+            PlatformInput::TouchDragCandidateProbe(_) => None,
         }
     }
 
@@ -958,6 +1028,7 @@ impl PlatformInput {
             PlatformInput::TouchDrag(_) => None,
             PlatformInput::FileDrop(_) => None,
             PlatformInput::Touch(_) => None,
+            PlatformInput::TouchDragCandidateProbe(_) => None,
         }
     }
 
@@ -979,6 +1050,7 @@ impl PlatformInput {
             PlatformInput::TouchDrag(_) => "touch_drag",
             PlatformInput::FileDrop(_) => "file_drop",
             PlatformInput::Touch(_) => "touch",
+            PlatformInput::TouchDragCandidateProbe(_) => "touch_drag_candidate_probe",
         }
     }
 

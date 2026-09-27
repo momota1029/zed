@@ -3117,6 +3117,8 @@ pub struct AnyDrag {
     /// Resolves the payload to offer the platform if the drag leaves the window.
     /// Invoked at most once per drag gesture, at promotion time.
     pub external_payload_source: Option<ExternalDragPayloadSource>,
+    /// Provenance of the input stream that started this drag.
+    pub source: crate::MouseInputSource,
 }
 
 /// Lazily resolves the payload handed to the platform when an internal drag is
