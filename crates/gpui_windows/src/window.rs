@@ -35,7 +35,13 @@ use windows::{
             Ole::*,
             SystemServices::*,
         },
-        UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+        UI::{
+            Controls::*,
+            HiDpi::*,
+            Input::{KeyboardAndMouse::*, Pointer::*},
+            Shell::*,
+            WindowsAndMessaging::*,
+        },
     },
     core::*,
 };
@@ -650,6 +656,54 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    fn promote_touch_drag_to_mouse(&self, touch_id: TouchId, cancelled: Arc<AtomicBool>) -> bool {
+        if self.state.touch_input_mode != TouchInputMode::Native {
+            return false;
+        }
+        let Some(pointer_id) = self
+            .state
+            .touch_state
+            .borrow_mut()
+            .prepare_handoff(touch_id, cancelled)
+        else {
+            return false;
+        };
+
+        let mut pointer_info = POINTER_INFO::default();
+        if unsafe { GetPointerInfo(pointer_id, &mut pointer_info) }.is_err()
+            || pointer_info.pointerType != PT_TOUCH
+            || !pointer_info.pointerFlags.contains(POINTER_FLAG_PRIMARY)
+        {
+            self.state
+                .touch_state
+                .borrow_mut()
+                .rollback_handoff(touch_id);
+            return false;
+        }
+
+        let Some(convert_primary_pointer_to_mouse_drag) =
+            resolve_convert_primary_pointer_to_mouse_drag()
+        else {
+            self.state
+                .touch_state
+                .borrow_mut()
+                .rollback_handoff(touch_id);
+            return false;
+        };
+        let converted = unsafe { convert_primary_pointer_to_mouse_drag(pointer_id) }.as_bool();
+        if !converted {
+            self.state
+                .touch_state
+                .borrow_mut()
+                .rollback_handoff(touch_id);
+        }
+        converted
+    }
+
+    fn finish_touch_drag_handoff(&self, touch_id: TouchId) {
+        self.state.touch_state.borrow_mut().finish_handoff(touch_id);
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.state.bounds()
     }
@@ -2194,6 +2248,16 @@ fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32
             let _ = set_window_composition_attribute(hwnd, &mut data as *mut _ as _);
         }
     }
+}
+
+type ConvertPrimaryPointerToMouseDrag = unsafe extern "system" fn(u32) -> BOOL;
+
+fn resolve_convert_primary_pointer_to_mouse_drag() -> Option<ConvertPrimaryPointerToMouseDrag> {
+    // Ordinal 2811 is Windows 11 desktop-only. Resolve it at runtime so older
+    // Windows versions do not acquire a loader-time dependency on the API.
+    let user32 = unsafe { GetModuleHandleW(windows::core::w!("user32.dll")).ok()? };
+    let address = unsafe { GetProcAddress(user32, windows::core::PCSTR(2811usize as *const u8)) }?;
+    Some(unsafe { std::mem::transmute(address) })
 }
 
 // When the platform title bar is hidden, Windows may think that our application is meant to appear 'fullscreen'

@@ -1208,6 +1208,7 @@ pub struct Window {
     window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
+    touch_drag_handoff: Option<crate::TouchId>,
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
@@ -2073,6 +2074,7 @@ impl Window {
                     .gestures()
                     .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
             ),
+            touch_drag_handoff: None,
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
@@ -5592,6 +5594,34 @@ impl Window {
     /// before gesture recognition, so pans track only raw touch positions.
     pub fn set_touch_prediction_enabled(&mut self, enabled: bool) {
         self.touch_prediction_enabled = enabled;
+    }
+
+    /// Promotes the currently claimed touch drag to Windows OLE-compatible
+    /// mouse input. Returns false when the platform cannot safely promote it.
+    pub fn promote_active_touch_drag_to_mouse(&mut self, cancelled: Arc<AtomicBool>) -> bool {
+        if self.touch_drag_handoff.is_some() {
+            return false;
+        }
+        let Some(touch_id) = self.touch_gestures.claimed_touch_drag_id() else {
+            return false;
+        };
+        if !self
+            .platform_window
+            .promote_touch_drag_to_mouse(touch_id, cancelled)
+        {
+            return false;
+        }
+        self.touch_gestures.finish_claimed_touch_drag(touch_id);
+        self.touch_drag_handoff = Some(touch_id);
+        true
+    }
+
+    /// Finishes the platform side of an OLE touch drag handoff.
+    pub fn finish_touch_drag_handoff(&mut self) {
+        let Some(touch_id) = self.touch_drag_handoff.take() else {
+            return;
+        };
+        self.platform_window.finish_touch_drag_handoff(touch_id);
     }
 
     /// Runs the portable gesture recognizer over a raw touch event and

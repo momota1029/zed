@@ -597,6 +597,21 @@ struct Momentum {
 }
 
 impl TouchGestureRecognizer {
+    pub(crate) fn claimed_touch_drag_id(&self) -> Option<TouchId> {
+        match &self.state {
+            TouchGestureState::TouchDragging(touch) => Some(touch.id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn finish_claimed_touch_drag(&mut self, id: TouchId) -> bool {
+        if self.claimed_touch_drag_id() != Some(id) {
+            return false;
+        }
+        self.state = TouchGestureState::Idle;
+        true
+    }
+
     pub(crate) fn new(tuning: GestureTuning) -> Self {
         Self {
             tuning,

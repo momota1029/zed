@@ -2,7 +2,10 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     rc::Rc,
-    sync::atomic::Ordering,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Context as _;
@@ -142,9 +145,105 @@ pub(crate) struct WindowsTouchState {
     active_contacts: HashSet<u32>,
     claimed: HashSet<u32>,
     next_id: u64,
+    promoted: Option<PromotedTouch>,
+}
+
+struct PromotedTouch {
+    pointer_id: u32,
+    touch_id: TouchId,
+    cancelled: Arc<AtomicBool>,
+    ole_active: bool,
+    terminal: bool,
 }
 
 impl WindowsTouchState {
+    pub(crate) fn prepare_handoff(
+        &mut self,
+        touch_id: TouchId,
+        cancelled: Arc<AtomicBool>,
+    ) -> Option<u32> {
+        if self.promoted.is_some() || self.active_contacts.len() != 1 {
+            return None;
+        }
+        let (&pointer_id, _) = self.active.iter().find(|(pointer_id, touch)| {
+            touch.id == touch_id && self.claimed.contains(pointer_id)
+        })?;
+        self.promoted = Some(PromotedTouch {
+            pointer_id,
+            touch_id,
+            cancelled,
+            ole_active: true,
+            terminal: false,
+        });
+        Some(pointer_id)
+    }
+
+    pub(crate) fn rollback_handoff(&mut self, touch_id: TouchId) {
+        if self
+            .promoted
+            .as_ref()
+            .is_some_and(|touch| touch.touch_id == touch_id)
+        {
+            self.promoted = None;
+        }
+    }
+
+    pub(crate) fn is_promoted_pointer(&self, pointer_id: u32) -> bool {
+        self.promoted
+            .as_ref()
+            .is_some_and(|touch| touch.pointer_id == pointer_id)
+    }
+
+    pub(crate) fn has_active_handoff(&self) -> bool {
+        self.promoted.is_some()
+    }
+
+    pub(crate) fn cancel_active_handoff(&self) {
+        if let Some(touch) = self.promoted.as_ref().filter(|touch| touch.ole_active) {
+            touch.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn finish_handoff(&mut self, touch_id: TouchId) {
+        if let Some(touch) = self
+            .promoted
+            .as_mut()
+            .filter(|touch| touch.touch_id == touch_id)
+        {
+            touch.ole_active = false;
+        }
+        self.clear_finished_handoff();
+    }
+
+    pub(crate) fn finish_promoted_pointer(&mut self, pointer_id: u32, cancelled: bool) -> bool {
+        let Some(touch) = self
+            .promoted
+            .as_mut()
+            .filter(|touch| touch.pointer_id == pointer_id)
+        else {
+            return false;
+        };
+        touch.terminal = true;
+        if cancelled {
+            touch.cancelled.store(true, Ordering::Release);
+        }
+        self.active.remove(&pointer_id);
+        self.active_contacts.remove(&pointer_id);
+        self.claimed.remove(&pointer_id);
+        self.clear_finished_handoff();
+        true
+    }
+
+    fn clear_finished_handoff(&mut self) {
+        if self
+            .promoted
+            .as_ref()
+            .is_some_and(|touch| !touch.ole_active && touch.terminal)
+        {
+            self.promoted = None;
+        }
+    }
+
     fn begin(
         &mut self,
         pointer_id: u32,
@@ -220,6 +319,48 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if matches!(
+            msg,
+            WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERCAPTURECHANGED
+        ) && self
+            .state
+            .touch_state
+            .borrow()
+            .is_promoted_pointer(wparam.loword() as u32)
+        {
+            let pointer_id = wparam.loword() as u32;
+            match msg {
+                WM_POINTERUP => {
+                    let mut info = POINTER_INFO::default();
+                    let cancelled = unsafe { GetPointerInfo(pointer_id, &mut info) }.is_err()
+                        || info.pointerFlags.contains(POINTER_FLAG_CANCELED);
+                    self.state
+                        .touch_state
+                        .borrow_mut()
+                        .finish_promoted_pointer(pointer_id, cancelled);
+                }
+                WM_POINTERCAPTURECHANGED => {
+                    self.state
+                        .touch_state
+                        .borrow_mut()
+                        .finish_promoted_pointer(pointer_id, true);
+                }
+                WM_POINTERUPDATE => {
+                    let mut info = POINTER_INFO::default();
+                    let cancelled = unsafe { GetPointerInfo(pointer_id, &mut info) }.is_err()
+                        || info.pointerFlags.contains(POINTER_FLAG_CANCELED);
+                    if cancelled {
+                        self.state
+                            .touch_state
+                            .borrow_mut()
+                            .finish_promoted_pointer(pointer_id, true);
+                    }
+                }
+                _ => {}
+            }
+            return LRESULT(0);
+        }
+
         let handled = match msg {
             // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
             // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
@@ -245,6 +386,16 @@ impl WindowsWindowInner {
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_QUERYENDSESSION => Some(1),
             WM_ENDSESSION => self.handle_end_session_msg(wparam),
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
+            | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP
+            | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP
+                if self.state.touch_state.borrow().has_active_handoff()
+                    && mouse_input_source_from_message() == MouseInputSource::Touch =>
+            {
+                // Leave the native message available to the active OLE modal loop,
+                // but never route the promoted contact through GPUI a second time.
+                None
+            }
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
@@ -634,17 +785,21 @@ impl WindowsWindowInner {
             .touch_state
             .borrow()
             .has_other_active_contact(pointer_id);
+        if has_other_active_contact {
+            self.state.touch_state.borrow().cancel_active_handoff();
+        }
 
         // A second contact cancels the GPUI-owned item sequence before it can
         // establish its own route. Pointer ownership itself never transfers.
-        let active_pointers = self
-            .state
-            .touch_state
-            .borrow()
-            .active
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+        let active_pointers = {
+            let touch_state = self.state.touch_state.borrow();
+            touch_state
+                .active
+                .keys()
+                .copied()
+                .filter(|pointer_id| !touch_state.is_promoted_pointer(*pointer_id))
+                .collect::<Vec<_>>()
+        };
         for active_pointer in active_pointers {
             self.cancel_active_touch(active_pointer, true);
         }

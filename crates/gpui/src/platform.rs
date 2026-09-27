@@ -70,7 +70,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
 use strum::EnumIter;
 use uuid::Uuid;
@@ -875,6 +875,18 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Promotes the exact claimed touch drag to Windows compatibility mouse input.
+    /// Unsupported platforms leave the in-app touch drag route unchanged.
+    fn promote_touch_drag_to_mouse(
+        &self,
+        _touch_id: crate::TouchId,
+        _cancelled: Arc<AtomicBool>,
+    ) -> bool {
+        false
+    }
+    /// Marks the end of an OLE handoff. Platform suppression can remain active
+    /// until the promoted pointer has also reached a terminal phase.
+    fn finish_touch_drag_handoff(&self, _touch_id: crate::TouchId) {}
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;
