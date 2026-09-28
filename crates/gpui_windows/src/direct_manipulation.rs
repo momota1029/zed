@@ -27,6 +27,7 @@ pub(crate) struct DirectManipulationHandler {
     scale_factor: Rc<Cell<f32>>,
     native_touch: bool,
     touch_position: Rc<Cell<Option<Point<Pixels>>>>,
+    content_transform: Rc<Cell<ContentTransformState>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
 }
 
@@ -67,6 +68,7 @@ impl DirectManipulationHandler {
 
             let scale_factor = Rc::new(Cell::new(scale_factor));
             let touch_position = Rc::new(Cell::new(None));
+            let content_transform = Rc::new(Cell::new(ContentTransformState::new()));
             let pending_events = Rc::new(RefCell::new(Vec::new()));
 
             let event_handler: IDirectManipulationViewportEventHandler =
@@ -74,6 +76,7 @@ impl DirectManipulationHandler {
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&touch_position),
+                    Rc::clone(&content_transform),
                     Rc::clone(&pending_events),
                 )
                 .into();
@@ -91,6 +94,7 @@ impl DirectManipulationHandler {
                 scale_factor,
                 native_touch,
                 touch_position,
+                content_transform,
                 pending_events,
             })
         }
@@ -112,6 +116,7 @@ impl DirectManipulationHandler {
                 return;
             }
 
+            self.prepare_contact();
             let mut pointer_info = POINTER_INFO::default();
             if GetPointerInfo(pointer_id, &mut pointer_info).is_ok() {
                 let mut position = pointer_info.ptPixelLocation;
@@ -133,6 +138,7 @@ impl DirectManipulationHandler {
             let mut pointer_type = POINTER_INPUT_TYPE::default();
             if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
             {
+                self.prepare_contact();
                 let mut pointer_info = POINTER_INFO::default();
                 if GetPointerInfo(pointer_id, &mut pointer_info).is_ok() {
                     let mut point = pointer_info.ptPixelLocation;
@@ -153,6 +159,43 @@ impl DirectManipulationHandler {
         unsafe {
             self.update_manager.Update(None).log_err();
         }
+    }
+
+    fn prepare_contact(&self) {
+        if !self.content_transform.get().resetting {
+            // Keep the last pan/pinch baseline when a new contact interrupts active input.
+            return;
+        }
+
+        // Drain pending reset notifications while suppression is active. Then confirm the
+        // viewport's actual primary content transform; READY or Update alone is not a baseline.
+        if unsafe { self.update_manager.Update(None) }
+            .log_err()
+            .is_none()
+        {
+            return;
+        }
+        let content: IDirectManipulationContent =
+            match unsafe { self.viewport.GetPrimaryContent() }.log_err() {
+                Some(content) => content,
+                None => return,
+            };
+        let mut transform = [0.0f32; 6];
+        if unsafe { content.GetContentTransform(&mut transform) }
+            .log_err()
+            .is_none()
+            || transform[0] == 0.0
+        {
+            return;
+        }
+
+        let mut state = self.content_transform.get();
+        state.reconcile_contact_transform(
+            transform[0],
+            transform[4] / self.scale_factor.get(),
+            transform[5] / self.scale_factor.get(),
+        );
+        self.content_transform.set(state);
     }
 
     /// Stop scroll inertia before a touch contact becomes GPUI-owned.
@@ -205,15 +248,82 @@ enum GestureKind {
     Pinch,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ContentTransformState {
+    scale: f32,
+    x_offset: f32,
+    y_offset: f32,
+    resetting: bool,
+}
+
+impl ContentTransformState {
+    pub(super) fn new() -> Self {
+        Self {
+            scale: 1.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            resetting: false,
+        }
+    }
+
+    pub(super) fn observe(&mut self, scale: f32, x_offset: f32, y_offset: f32) -> (Self, bool) {
+        let previous = *self;
+        self.scale = scale;
+        self.x_offset = x_offset;
+        self.y_offset = y_offset;
+
+        let suppress = self.resetting;
+        (previous, suppress)
+    }
+
+    pub(super) fn start_reset(&mut self) {
+        self.resetting = true;
+    }
+
+    pub(super) fn cancel_reset(&mut self) {
+        self.resetting = false;
+    }
+
+    pub(super) fn reconcile_contact_transform(&mut self, scale: f32, x_offset: f32, y_offset: f32) {
+        if !self.resetting {
+            return;
+        }
+
+        self.scale = scale;
+        self.x_offset = x_offset;
+        self.y_offset = y_offset;
+        if is_identity_transform(scale, x_offset, y_offset) {
+            self.resetting = false;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn y_offset(&self) -> f32 {
+        self.y_offset
+    }
+
+    #[cfg(test)]
+    pub(super) fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_resetting(&self) -> bool {
+        self.resetting
+    }
+}
+
+fn is_identity_transform(scale: f32, x_offset: f32, y_offset: f32) -> bool {
+    float_equals(scale, 1.0) && float_equals(x_offset, 0.0) && float_equals(y_offset, 0.0)
+}
+
 #[windows_core::implement(IDirectManipulationViewportEventHandler)]
 struct DirectManipulationEventHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
     touch_position: Rc<Cell<Option<Point<Pixels>>>>,
+    content_transform: Rc<Cell<ContentTransformState>>,
     gesture_kind: Cell<GestureKind>,
-    last_scale: Cell<f32>,
-    last_x_offset: Cell<f32>,
-    last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
 }
@@ -223,16 +333,15 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         touch_position: Rc<Cell<Option<Point<Pixels>>>>,
+        content_transform: Rc<Cell<ContentTransformState>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
     ) -> Self {
         Self {
             window,
             scale_factor,
             touch_position,
+            content_transform,
             gesture_kind: Cell::new(GestureKind::None),
-            last_scale: Cell::new(1.0),
-            last_x_offset: Cell::new(0.0),
-            last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
             pending_events,
         }
@@ -298,6 +407,11 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
         }
 
         if current == DIRECTMANIPULATION_READY {
+            // Nested READY can be raised by ZoomToRect itself. Keep reset suppression in force
+            // until its identity transform notification is observed.
+            if self.content_transform.get().resetting {
+                return Ok(());
+            }
             self.end_gesture();
             // INERTIA が新しい接触で中断される場合、RUNNING への遷移は新しい pointer
             // position を既に記録している。そこで消すと次の scroll が cursor 位置へ
@@ -306,28 +420,31 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
 
             // Reset the content transform so the viewport is ready for the next gesture.
             // ZoomToRect triggers a second RUNNING -> READY cycle, so prevent an infinite loop here.
-            if self.last_scale.get() != 1.0
-                || self.last_x_offset.get() != 0.0
-                || self.last_y_offset.get() != 0.0
-            {
-                if let Some(viewport) = viewport.as_ref() {
-                    unsafe {
-                        viewport
-                            .ZoomToRect(
-                                0.0,
-                                0.0,
-                                DEFAULT_VIEWPORT_SIZE as f32,
-                                DEFAULT_VIEWPORT_SIZE as f32,
-                                false,
-                            )
-                            .log_err();
-                    }
+            let mut transform = self.content_transform.get();
+            if !is_identity_transform(transform.scale, transform.x_offset, transform.y_offset) {
+                transform.start_reset();
+                self.content_transform.set(transform);
+                let reset_requested = viewport.as_ref().and_then(|viewport| unsafe {
+                    viewport
+                        .ZoomToRect(
+                            0.0,
+                            0.0,
+                            DEFAULT_VIEWPORT_SIZE as f32,
+                            DEFAULT_VIEWPORT_SIZE as f32,
+                            false,
+                        )
+                        .log_err()
+                });
+                if reset_requested.is_none() {
+                    // A failed/unavailable reset cannot leave suppression stuck forever. Read
+                    // current state after ZoomToRect because synchronous callbacks may update it.
+                    let mut transform = self.content_transform.get();
+                    transform.cancel_reset();
+                    self.content_transform.set(transform);
                 }
+            } else {
+                self.content_transform.set(ContentTransformState::new());
             }
-
-            self.last_scale.set(1.0);
-            self.last_x_offset.set(0.0);
-            self.last_y_offset.set(0.0);
         }
 
         Ok(())
@@ -362,9 +479,16 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
             return Ok(());
         }
 
-        let last_scale = self.last_scale.get();
-        let last_x = self.last_x_offset.get();
-        let last_y = self.last_y_offset.get();
+        let mut transform = self.content_transform.get();
+        let (previous_transform, suppress) = transform.observe(scale, x_offset, y_offset);
+        self.content_transform.set(transform);
+        if suppress {
+            return Ok(());
+        }
+
+        let last_scale = previous_transform.scale;
+        let last_x = previous_transform.x_offset;
+        let last_y = previous_transform.y_offset;
 
         if float_equals(scale, last_scale)
             && float_equals(x_offset, last_x)
@@ -426,10 +550,6 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
             }
             GestureKind::None => {}
         }
-
-        self.last_scale.set(scale);
-        self.last_x_offset.set(x_offset);
-        self.last_y_offset.set(y_offset);
 
         Ok(())
     }
