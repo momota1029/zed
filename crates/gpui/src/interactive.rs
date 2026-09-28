@@ -247,6 +247,8 @@ pub struct TouchEvent {
     /// Stable identity of the element that claimed this contact for GPUI at pointer-down.
     /// A claimed contact may still be an ordinary tap/pan rather than a drag candidate.
     pub drag_target: Option<crate::GlobalElementId>,
+    /// Finger offset inside an accepted touch-drag target at contact down.
+    pub drag_cursor_offset: Option<Point<Pixels>>,
 }
 
 /// A non-mutating hit-test request used by a platform to choose whether a
@@ -256,6 +258,7 @@ pub struct TouchDragCandidateProbe {
     position: Point<Pixels>,
     target: std::rc::Rc<std::cell::RefCell<Option<crate::GlobalElementId>>>,
     accepted: std::rc::Rc<std::cell::Cell<bool>>,
+    drag_cursor_offset: std::rc::Rc<std::cell::Cell<Option<Point<Pixels>>>>,
 }
 
 impl TouchDragCandidateProbe {
@@ -265,6 +268,7 @@ impl TouchDragCandidateProbe {
             position,
             target: Default::default(),
             accepted: Default::default(),
+            drag_cursor_offset: Default::default(),
         }
     }
 
@@ -288,6 +292,16 @@ impl TouchDragCandidateProbe {
     #[doc(hidden)]
     pub fn accept(&self, accepted: bool) {
         self.accepted.set(accepted);
+        if !accepted {
+            self.drag_cursor_offset.set(None);
+        }
+    }
+
+    /// Stores the contact-down offset for an accepted drag candidate.
+    #[doc(hidden)]
+    pub fn accept_with_cursor_offset(&self, cursor_offset: Point<Pixels>) {
+        self.drag_cursor_offset.set(Some(cursor_offset));
+        self.accepted.set(true);
     }
 
     /// Returns whether the reserved target may start a typed drag.
@@ -304,6 +318,15 @@ impl TouchDragCandidateProbe {
     /// Returns the one stable element identity reserved by the hit-tested probe.
     pub fn target(&self) -> Option<crate::GlobalElementId> {
         self.target.borrow().clone()
+    }
+
+    /// Returns the contact-down offset only when the probe was accepted as a drag candidate.
+    pub fn drag_cursor_offset(&self) -> Option<Point<Pixels>> {
+        if self.is_candidate() {
+            self.drag_cursor_offset.get()
+        } else {
+            None
+        }
     }
 }
 
@@ -1076,6 +1099,20 @@ mod test {
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
         KeyBinding, Keystroke, Modifiers, ParentElement, Render, TestAppContext, Window, div,
     };
+
+    #[test]
+    fn touch_drag_probe_exposes_offset_only_for_an_accepted_candidate() {
+        let position = crate::point(crate::px(18.), crate::px(27.));
+        let offset = crate::point(crate::px(8.), crate::px(7.));
+        let target = crate::GlobalElementId::default();
+        let probe = crate::TouchDragCandidateProbe::new(position);
+        assert!(probe.reserve(target));
+        probe.accept_with_cursor_offset(offset);
+        assert_eq!(probe.drag_cursor_offset(), Some(offset));
+
+        probe.accept(false);
+        assert_eq!(probe.drag_cursor_offset(), None);
+    }
 
     struct TestView {
         saw_key_down: bool,

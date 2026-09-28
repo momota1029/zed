@@ -392,6 +392,8 @@ pub struct TouchDragEvent {
     pub position: Point<Pixels>,
     /// The exact element identity selected by the contact-down probe.
     pub target: Option<crate::GlobalElementId>,
+    /// The finger offset from the target origin at contact down, if accepted as a drag candidate.
+    pub cursor_offset: Option<Point<Pixels>>,
 }
 
 impl Sealed for TouchDragEvent {}
@@ -545,6 +547,7 @@ enum TouchGestureState {
 struct ActiveTouch {
     id: TouchId,
     drag_target: Option<crate::GlobalElementId>,
+    drag_cursor_offset: Option<Point<Pixels>>,
     start_position: Point<Pixels>,
     /// The latest raw position reported for this touch.
     last_position: Point<Pixels>,
@@ -652,6 +655,7 @@ impl TouchGestureRecognizer {
                     let touch = ActiveTouch {
                         id: event.id,
                         drag_target: event.drag_target.clone(),
+                        drag_cursor_offset: event.drag_cursor_offset,
                         start_position: event.position,
                         last_position: event.position,
                         emitted_position: event.position,
@@ -702,6 +706,7 @@ impl TouchGestureRecognizer {
                                 start_position: touch.start_position,
                                 position: event.position,
                                 target: touch.drag_target.clone(),
+                                cursor_offset: touch.drag_cursor_offset,
                             }));
                             self.state = TouchGestureState::TouchDragStartPending(touch);
                         } else {
@@ -787,6 +792,7 @@ impl TouchGestureRecognizer {
                         start_position: touch.start_position,
                         position: event.position,
                         target: touch.drag_target.clone(),
+                        cursor_offset: touch.drag_cursor_offset,
                     }));
                     self.state = TouchGestureState::TouchDragging(touch);
                 }
@@ -901,6 +907,7 @@ impl TouchGestureRecognizer {
                         start_position: touch.start_position,
                         position: event.position,
                         target: touch.drag_target.clone(),
+                        cursor_offset: touch.drag_cursor_offset,
                     }));
                 }
                 other => self.state = other,
@@ -928,6 +935,7 @@ impl TouchGestureRecognizer {
                         start_position: touch.start_position,
                         position: event.position,
                         target: touch.drag_target.clone(),
+                        cursor_offset: touch.drag_cursor_offset,
                     }));
                 }
                 other => self.state = other,
@@ -1004,6 +1012,7 @@ impl TouchGestureRecognizer {
             start_position: touch.start_position,
             position: touch.last_position,
             target: touch.drag_target.clone(),
+            cursor_offset: touch.drag_cursor_offset,
         }))
     }
 
@@ -2069,34 +2078,44 @@ mod tests {
         let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
         let touch = TouchId(1);
         let now = Instant::now();
-        recognizer.handle_event_at(&touch_event(touch, TouchPhase::Started, 10., 20.), now);
-        let Some(RecognizedTouchGesture::TouchDrag(started)) = recognizer.offer_touch_drag(touch)
-        else {
-            panic!("expected touch drag");
+        let offset = point(px(8.), px(7.));
+        let mut down = touch_event(touch, TouchPhase::Started, 10., 20.);
+        down.drag_candidate = true;
+        down.drag_target = Some(crate::GlobalElementId::default());
+        down.drag_cursor_offset = Some(offset);
+        recognizer.handle_event_at(&down, now);
+        let started = recognizer.handle_event_at(
+            &touch_event(touch, TouchPhase::Moved, 40., 50.),
+            now + Duration::from_millis(10),
+        );
+        let [RecognizedTouchGesture::TouchDrag(started)] = started.as_slice() else {
+            panic!("expected started touch drag, got {started:?}");
         };
         assert_eq!(started.phase, TouchPhase::Started);
         assert_eq!(started.start_position, point(px(10.), px(20.)));
+        assert_eq!(started.cursor_offset, Some(offset));
+        assert!(started.target.is_some());
         recognizer.resolve_touch_drag(true);
 
         let moved = recognizer.handle_event_at(
-            &touch_event(touch, TouchPhase::Moved, 40., 50.),
-            now + Duration::from_millis(10),
+            &touch_event(touch, TouchPhase::Moved, 50., 60.),
+            now + Duration::from_millis(20),
         );
         let [RecognizedTouchGesture::TouchDrag(moved)] = moved.as_slice() else {
             panic!("expected moved touch drag, got {moved:?}");
         };
         assert_eq!(moved.phase, TouchPhase::Moved);
-        assert_eq!(moved.position, point(px(40.), px(50.)));
+        assert_eq!(moved.position, point(px(50.), px(60.)));
 
         let ended = recognizer.handle_event_at(
-            &touch_event(touch, TouchPhase::Ended, 45., 55.),
-            now + Duration::from_millis(20),
+            &touch_event(touch, TouchPhase::Ended, 55., 65.),
+            now + Duration::from_millis(30),
         );
         let [RecognizedTouchGesture::TouchDrag(ended)] = ended.as_slice() else {
             panic!("expected ended touch drag, got {ended:?}");
         };
         assert_eq!(ended.phase, TouchPhase::Ended);
-        assert_eq!(ended.position, point(px(45.), px(55.)));
+        assert_eq!(ended.position, point(px(55.), px(65.)));
     }
 
     #[test]
@@ -2347,6 +2366,7 @@ mod tests {
             force: None,
             drag_candidate: false,
             drag_target: None,
+            drag_cursor_offset: None,
         }
     }
 }

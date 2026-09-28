@@ -283,6 +283,7 @@ impl WebWindowInner {
                     force: None,
                     drag_candidate: false,
                     drag_target: None,
+                    drag_cursor_offset: None,
                 }));
                 // Keyboard and IME focus intentionally do not change here:
                 // whether this touch is a tap or a pan is only known at
@@ -360,6 +361,7 @@ impl WebWindowInner {
                     force: None,
                     drag_candidate: false,
                     drag_target: None,
+                    drag_cursor_offset: None,
                 }));
 
                 // A keyboard opening or closing mid-gesture reflows the
@@ -475,6 +477,7 @@ impl WebWindowInner {
                     force: None,
                     drag_candidate: false,
                     drag_target: None,
+                    drag_cursor_offset: None,
                 }));
             } else {
                 this.pressed_button.set(None);
@@ -608,6 +611,7 @@ impl WebWindowInner {
                     force: None,
                     drag_candidate: false,
                     drag_target: None,
+                    drag_cursor_offset: None,
                 }));
                 return;
             }

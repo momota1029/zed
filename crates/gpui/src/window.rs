@@ -2119,6 +2119,8 @@ pub struct DispatchEventResult {
     pub touch_drag_candidate: bool,
     /// The stable target identity for the accepted touch drag candidate.
     pub touch_drag_target: Option<crate::GlobalElementId>,
+    /// Finger offset from the accepted target's origin at contact down.
+    pub touch_drag_cursor_offset: Option<Point<Pixels>>,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -5535,7 +5537,12 @@ impl Window {
             touch_drag_candidate: touch_drag_candidate_probe
                 .as_ref()
                 .is_some_and(|probe| probe.is_candidate()),
-            touch_drag_target: touch_drag_candidate_probe.and_then(|probe| probe.target()),
+            touch_drag_target: touch_drag_candidate_probe
+                .as_ref()
+                .and_then(|probe| probe.target()),
+            touch_drag_cursor_offset: touch_drag_candidate_probe
+                .as_ref()
+                .and_then(|probe| probe.drag_cursor_offset()),
         }
     }
 
@@ -8893,6 +8900,7 @@ mod tests {
                         force: None,
                         drag_candidate: false,
                         drag_target: None,
+                        drag_cursor_offset: None,
                     }
                     .to_platform_input(),
                     cx,

@@ -3159,7 +3159,11 @@ impl Interactivity {
                             ..Default::default()
                         };
                         if (listener.can_start)(&down) && probe.reserve(global_id.clone()) {
-                            probe.accept(candidate(&down, window, _cx));
+                            if candidate(&down, window, _cx) {
+                                probe.accept_with_cursor_offset(probe.position() - hitbox.origin);
+                            } else {
+                                probe.accept(false);
+                            }
                         }
                     }
                 });
@@ -3239,10 +3243,7 @@ impl Interactivity {
                     let clicked_state = clicked_state.clone();
                     let global_id = global_id.cloned();
                     move |event: &TouchDragEvent, phase, window, cx| {
-                        if phase != DispatchPhase::Bubble
-                            || event.phase != TouchPhase::Started
-                            || event.target.as_ref() != global_id.as_ref()
-                            || !hitbox.is_hovered(window)
+                        if !touch_drag_start_targets_element(event, phase, global_id.as_ref())
                             || cx.has_active_drag()
                         {
                             return;
@@ -3255,7 +3256,9 @@ impl Interactivity {
                             return;
                         }
                         *clicked_state.borrow_mut() = ElementClickedState::default();
-                        let cursor_offset = event.position - hitbox.origin;
+                        let cursor_offset = event
+                            .cursor_offset
+                            .unwrap_or_else(|| event.position - hitbox.origin);
                         let drag =
                             (listener.render)(listener.value.as_ref(), cursor_offset, window, cx);
                         let external_payload_source =
@@ -3867,6 +3870,19 @@ impl Interactivity {
             node.add_action(*action);
         }
     }
+}
+
+/// Tests the contact-down target identity captured by the touch candidate probe.
+/// Direct Manipulation may scroll the row away from the original contact point before slop is
+/// crossed, so activation must not depend on the current hitbox hover state.
+fn touch_drag_start_targets_element(
+    event: &TouchDragEvent,
+    phase: DispatchPhase,
+    global_id: Option<&GlobalElementId>,
+) -> bool {
+    phase == DispatchPhase::Bubble
+        && event.phase == TouchPhase::Started
+        && matches!((global_id, event.target.as_ref()), (Some(expected), Some(actual)) if expected == actual)
 }
 
 /// The per-frame state of an interactive element. Used for tracking stateful interactions like clicks
@@ -4718,9 +4734,152 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, Keystroke,
-        MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas, util::FluentBuilder as _,
+        MouseMoveEvent, TestAppContext, TouchDragCandidateProbe, TouchDragEvent, TouchEvent,
+        TouchId, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    struct TouchDragMovedRow {
+        moved: bool,
+        cursor_offset: Rc<Cell<Option<Point<Pixels>>>>,
+    }
+
+    impl Render for TouchDragMovedRow {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let cursor_offset = self.cursor_offset.clone();
+            let top = if self.moved { px(300.) } else { px(20.) };
+            div().size_full().child(
+                div()
+                    .id("touch-drag-row")
+                    .absolute()
+                    .left(px(10.))
+                    .top(top)
+                    .size(px(80.))
+                    .on_drag((), move |_, offset, _, cx| {
+                        cursor_offset.set(Some(offset));
+                        cx.new(|_| crate::Empty)
+                    })
+                    .on_touch_drag_when(|_, _, _| true),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn touch_drag_after_repaint_uses_the_captured_target_and_down_offset(cx: &mut TestAppContext) {
+        let cursor_offset = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let cursor_offset = cursor_offset.clone();
+            move |_, _| TouchDragMovedRow {
+                moved: false,
+                cursor_offset,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let contact_position = point(px(18.), px(27.));
+        let probe = TouchDragCandidateProbe::new(contact_position);
+        let (target, cursor_offset_at_down) = cx
+            .update_window(any_window, |_, window, cx| {
+                let result = window.dispatch_event(probe.clone().to_platform_input(), cx);
+                assert!(result.touch_drag_candidate);
+                (
+                    result.touch_drag_target.expect("probe admitted the row"),
+                    result
+                        .touch_drag_cursor_offset
+                        .expect("accepted probe records its offset"),
+                )
+            })
+            .unwrap();
+
+        let touch_id = TouchId(42);
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: touch_id,
+                    phase: TouchPhase::Started,
+                    position: contact_position,
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: true,
+                    drag_target: Some(target.clone()),
+                    drag_cursor_offset: Some(cursor_offset_at_down),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.moved = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: touch_id,
+                    phase: TouchPhase::Moved,
+                    position: point(px(20.), px(57.)),
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: false,
+                    drag_target: None,
+                    drag_cursor_offset: None,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+
+        assert_eq!(cursor_offset.get(), Some(cursor_offset_at_down));
+    }
+
+    #[test]
+    fn touch_drag_start_keeps_the_contact_down_element_after_it_scrolls_away() {
+        let down_target = GlobalElementId(vec![crate::ElementId::Integer(1)].into());
+        let other_target = GlobalElementId(vec![crate::ElementId::Integer(2)].into());
+        let event = TouchDragEvent {
+            phase: TouchPhase::Started,
+            start_position: point(px(10.), px(10.)),
+            // The contact has moved far from its down point, as when scrolling shifts the row.
+            position: point(px(10.), px(400.)),
+            target: Some(down_target.clone()),
+            cursor_offset: None,
+        };
+
+        assert!(touch_drag_start_targets_element(
+            &event,
+            DispatchPhase::Bubble,
+            Some(&down_target),
+        ));
+        assert!(!touch_drag_start_targets_element(
+            &event,
+            DispatchPhase::Bubble,
+            Some(&other_target),
+        ));
+        assert!(!touch_drag_start_targets_element(
+            &event,
+            DispatchPhase::Capture,
+            Some(&down_target),
+        ));
+        let mut unclaimed_event = event.clone();
+        unclaimed_event.target = None;
+        assert!(!touch_drag_start_targets_element(
+            &unclaimed_event,
+            DispatchPhase::Bubble,
+            None,
+        ));
+    }
 
     #[test]
     fn custom_drag_threshold_uses_distance_from_pointer_down() {
@@ -5238,6 +5397,7 @@ mod tests {
                         force: None,
                         drag_candidate: false,
                         drag_target: None,
+                        drag_cursor_offset: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5267,6 +5427,7 @@ mod tests {
                         force: None,
                         drag_candidate: false,
                         drag_target: None,
+                        drag_cursor_offset: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5291,6 +5452,7 @@ mod tests {
                         force: None,
                         drag_candidate: false,
                         drag_target: None,
+                        drag_cursor_offset: None,
                     }
                     .to_platform_input(),
                     cx,

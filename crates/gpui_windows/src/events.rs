@@ -137,6 +137,7 @@ struct ActiveTouch {
     position: Point<Pixels>,
     drag_target: Option<gpui::GlobalElementId>,
     drag_candidate: bool,
+    drag_cursor_offset: Option<Point<Pixels>>,
 }
 
 #[derive(Default)]
@@ -250,6 +251,7 @@ impl WindowsTouchState {
         position: Point<Pixels>,
         drag_target: Option<gpui::GlobalElementId>,
         drag_candidate: bool,
+        drag_cursor_offset: Option<Point<Pixels>>,
     ) -> Option<(ActiveTouch, Option<ActiveTouch>)> {
         let next_id = self.next_id.checked_add(1)?;
         self.next_id = next_id;
@@ -258,6 +260,7 @@ impl WindowsTouchState {
             position,
             drag_target,
             drag_candidate,
+            drag_cursor_offset,
         };
         self.active_contacts.insert(pointer_id);
         self.claimed.insert(pointer_id);
@@ -447,16 +450,16 @@ impl WindowsWindowInner {
             WM_MOUSEWHEEL => self.handle_mouse_wheel_msg(handle, wparam, lparam),
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
             WM_POINTERDOWN if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Started, None, false)
+                self.handle_pointer_msg(handle, wparam, TouchPhase::Started, None, false, None)
             }
             WM_POINTERDOWN if self.state.touch_input_mode == TouchInputMode::Native => {
                 self.handle_native_pointer_down(handle, wparam)
             }
             WM_POINTERUPDATE if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Moved, None, false)
+                self.handle_pointer_msg(handle, wparam, TouchPhase::Moved, None, false, None)
             }
             WM_POINTERUP if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Ended, None, false)
+                self.handle_pointer_msg(handle, wparam, TouchPhase::Ended, None, false, None)
             }
             WM_POINTERUPDATE | WM_POINTERUP
                 if self.state.touch_input_mode == TouchInputMode::Native
@@ -476,6 +479,7 @@ impl WindowsWindowInner {
                     },
                     None,
                     false,
+                    None,
                 )
             }
             WM_POINTERUP if self.state.touch_input_mode == TouchInputMode::Native => {
@@ -493,7 +497,14 @@ impl WindowsWindowInner {
                         .borrow()
                         .is_claimed(wparam.loword() as u32)
                 {
-                    self.handle_pointer_msg(handle, wparam, TouchPhase::Cancelled, None, false)
+                    self.handle_pointer_msg(
+                        handle,
+                        wparam,
+                        TouchPhase::Cancelled,
+                        None,
+                        false,
+                        None,
+                    )
                 } else {
                     if self.state.touch_input_mode == TouchInputMode::Native {
                         self.state
@@ -817,13 +828,16 @@ impl WindowsWindowInner {
             self.state.direct_manipulation.on_pointer_down(wparam);
             return None;
         };
-        if let Some((target, drag_candidate)) = self.dispatch_touch_drag_candidate_probe(position) {
+        if let Some((target, drag_candidate, drag_cursor_offset)) =
+            self.dispatch_touch_drag_candidate_probe(position)
+        {
             self.handle_pointer_msg(
                 handle,
                 wparam,
                 TouchPhase::Started,
                 Some(target),
                 drag_candidate,
+                drag_cursor_offset,
             )
         } else {
             self.state
@@ -838,17 +852,20 @@ impl WindowsWindowInner {
     fn dispatch_touch_drag_candidate_probe(
         &self,
         position: Point<Pixels>,
-    ) -> Option<(gpui::GlobalElementId, bool)> {
+    ) -> Option<(gpui::GlobalElementId, bool, Option<Point<Pixels>>)> {
         let Some(mut callback) = self.state.callbacks.input.take() else {
             return None;
         };
-        let result = callback(PlatformInput::TouchDragCandidateProbe(
-            TouchDragCandidateProbe::new(position),
-        ));
+        let probe = TouchDragCandidateProbe::new(position);
+        let result = callback(PlatformInput::TouchDragCandidateProbe(probe.clone()));
         self.state.callbacks.input.set(Some(callback));
-        result
-            .touch_drag_target
-            .map(|target| (target, result.touch_drag_candidate))
+        result.touch_drag_target.map(|target| {
+            (
+                target,
+                result.touch_drag_candidate,
+                result.touch_drag_cursor_offset,
+            )
+        })
     }
 
     fn handle_pointer_msg(
@@ -858,6 +875,7 @@ impl WindowsWindowInner {
         phase: TouchPhase,
         drag_target: Option<gpui::GlobalElementId>,
         drag_candidate: bool,
+        drag_cursor_offset: Option<Point<Pixels>>,
     ) -> Option<isize> {
         let pointer_id = wparam.loword() as u32;
         let mut pointer_info = POINTER_INFO::default();
@@ -894,6 +912,7 @@ impl WindowsWindowInner {
                             phase,
                             drag_target.clone(),
                             drag_candidate,
+                            drag_cursor_offset,
                             index + 1 == sample_count,
                         );
                         // Leave unclaimed contacts to the OS even when history is available.
@@ -912,6 +931,7 @@ impl WindowsWindowInner {
             phase,
             drag_target,
             drag_candidate,
+            drag_cursor_offset,
             true,
         )
     }
@@ -924,6 +944,7 @@ impl WindowsWindowInner {
         phase: TouchPhase,
         drag_target: Option<gpui::GlobalElementId>,
         drag_candidate: bool,
+        drag_cursor_offset: Option<Point<Pixels>>,
         predict: bool,
     ) -> Option<isize> {
         let timestamp = pointer_sample_time(&pointer_info);
@@ -951,6 +972,7 @@ impl WindowsWindowInner {
                     position,
                     drag_target.clone(),
                     drag_candidate,
+                    drag_cursor_offset,
                 )?;
                 if let Some(replaced) = replaced {
                     self.dispatch_touch(TouchEvent {
@@ -962,6 +984,7 @@ impl WindowsWindowInner {
                         force: None,
                         drag_candidate: false,
                         drag_target: None,
+                        drag_cursor_offset: None,
                     });
                 }
                 Some(touch)
@@ -988,6 +1011,7 @@ impl WindowsWindowInner {
             force: None,
             drag_candidate: touch.drag_candidate && phase == TouchPhase::Started,
             drag_target: touch.drag_target.clone(),
+            drag_cursor_offset: touch.drag_cursor_offset,
         });
 
         // Consuming every message in a claimed touch sequence prevents Windows
@@ -1023,6 +1047,7 @@ impl WindowsWindowInner {
                 force: None,
                 drag_candidate: false,
                 drag_target: touch.drag_target.clone(),
+                drag_cursor_offset: touch.drag_cursor_offset,
             });
         }
         claimed.then_some(0)
@@ -2481,13 +2506,13 @@ mod tests {
     fn windows_pointer_ids_do_not_reuse_touch_ids() {
         let mut state = WindowsTouchState::default();
         let first = state
-            .begin(7, point(px(1.), px(2.)), None, false)
+            .begin(7, point(px(1.), px(2.)), None, false, None)
             .unwrap()
             .0;
         assert_eq!(state.finish(7).unwrap().id, first.id);
 
         let second = state
-            .begin(7, point(px(3.), px(4.)), None, false)
+            .begin(7, point(px(3.), px(4.)), None, false, None)
             .unwrap()
             .0;
         assert_ne!(second.id, first.id);
@@ -2496,16 +2521,46 @@ mod tests {
     #[test]
     fn active_touch_keeps_its_last_position_for_cancellation() {
         let mut state = WindowsTouchState::default();
-        state.begin(9, point(px(1.), px(2.)), None, false).unwrap();
+        state
+            .begin(9, point(px(1.), px(2.)), None, false, None)
+            .unwrap();
         let updated = state.update(9, point(px(5.), px(8.))).unwrap();
         assert_eq!(state.finish(9).unwrap().position, updated.position);
         assert!(!state.is_claimed(9));
     }
 
     #[test]
+    fn active_touch_carries_drag_offset_until_terminal_cleanup() {
+        let mut state = WindowsTouchState::default();
+        let offset = point(px(8.), px(7.));
+        let (touch, replaced) = state
+            .begin(
+                12,
+                point(px(18.), px(27.)),
+                Some(gpui::GlobalElementId::default()),
+                true,
+                Some(offset),
+            )
+            .unwrap();
+        assert!(replaced.is_none());
+        assert_eq!(
+            state
+                .update(12, point(px(20.), px(57.)))
+                .unwrap()
+                .drag_cursor_offset,
+            Some(offset)
+        );
+        assert_eq!(state.finish(12).unwrap().drag_cursor_offset, Some(offset));
+        assert!(state.update(12, point(px(21.), px(58.))).is_none());
+        assert_eq!(touch.drag_cursor_offset, Some(offset));
+    }
+
+    #[test]
     fn locally_cancelled_touch_remains_claimed_until_os_terminal_message() {
         let mut state = WindowsTouchState::default();
-        state.begin(11, point(px(1.), px(2.)), None, false).unwrap();
+        state
+            .begin(11, point(px(1.), px(2.)), None, false, None)
+            .unwrap();
 
         let (cancelled, claimed) = state.cancel(11, false);
         assert!(cancelled.is_some());
