@@ -251,14 +251,31 @@ pub struct TouchEvent {
     pub drag_cursor_offset: Option<Point<Pixels>>,
 }
 
+/// The retained source handler for an accepted touch drag candidate.
+pub(crate) type TouchDragStartHandler = Box<
+    dyn FnMut(&TouchDragEvent, crate::DispatchPhase, &mut crate::Window, &mut crate::App) + 'static,
+>;
+
 /// A non-mutating hit-test request used by a platform to choose whether a
 /// touch contact belongs to GPUI or to a native gesture handler.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TouchDragCandidateProbe {
     position: Point<Pixels>,
     target: std::rc::Rc<std::cell::RefCell<Option<crate::GlobalElementId>>>,
     accepted: std::rc::Rc<std::cell::Cell<bool>>,
     drag_cursor_offset: std::rc::Rc<std::cell::Cell<Option<Point<Pixels>>>>,
+    drag_start_handler: std::rc::Rc<std::cell::RefCell<Option<TouchDragStartHandler>>>,
+}
+
+impl std::fmt::Debug for TouchDragCandidateProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TouchDragCandidateProbe")
+            .field("position", &self.position)
+            .field("target", &self.target.borrow())
+            .field("accepted", &self.accepted.get())
+            .field("drag_cursor_offset", &self.drag_cursor_offset.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TouchDragCandidateProbe {
@@ -269,6 +286,7 @@ impl TouchDragCandidateProbe {
             target: Default::default(),
             accepted: Default::default(),
             drag_cursor_offset: Default::default(),
+            drag_start_handler: Default::default(),
         }
     }
 
@@ -294,6 +312,7 @@ impl TouchDragCandidateProbe {
         self.accepted.set(accepted);
         if !accepted {
             self.drag_cursor_offset.set(None);
+            self.drag_start_handler.borrow_mut().take();
         }
     }
 
@@ -302,6 +321,27 @@ impl TouchDragCandidateProbe {
     pub fn accept_with_cursor_offset(&self, cursor_offset: Point<Pixels>) {
         self.drag_cursor_offset.set(Some(cursor_offset));
         self.accepted.set(true);
+    }
+
+    /// Retains the accepted source callback until touch drag activation, even if its element is
+    /// virtualized out of the current frame before touch slop is crossed.
+    #[doc(hidden)]
+    pub(crate) fn retain_drag_start_handler(
+        &self,
+        handler: impl FnMut(&TouchDragEvent, crate::DispatchPhase, &mut crate::Window, &mut crate::App)
+        + 'static,
+    ) {
+        if self.is_candidate() {
+            *self.drag_start_handler.borrow_mut() = Some(Box::new(handler));
+        }
+    }
+
+    pub(crate) fn take_drag_start_handler(&self) -> Option<TouchDragStartHandler> {
+        if self.is_candidate() {
+            self.drag_start_handler.borrow_mut().take()
+        } else {
+            None
+        }
     }
 
     /// Returns whether the reserved target may start a typed drag.

@@ -1176,6 +1176,12 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    touch_drag_activations: Vec<(
+        Option<crate::TouchId>,
+        crate::GlobalElementId,
+        Point<Pixels>,
+        crate::interactive::TouchDragStartHandler,
+    )>,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -2041,6 +2047,7 @@ impl Window {
             focused_text_input_active: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            touch_drag_activations: Vec::new(),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -5363,6 +5370,29 @@ impl Window {
             PlatformInput::TouchDragCandidateProbe(probe) => Some(probe.clone()),
             _ => None,
         };
+        let touch_drag_start = match &event {
+            PlatformInput::Touch(touch)
+                if touch.phase == crate::TouchPhase::Started && touch.drag_candidate =>
+            {
+                Some((
+                    touch.id,
+                    touch.drag_target.clone(),
+                    touch.drag_cursor_offset,
+                ))
+            }
+            _ => None,
+        };
+        let touch_drag_terminal = match &event {
+            PlatformInput::Touch(touch)
+                if matches!(
+                    touch.phase,
+                    crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
+                ) =>
+            {
+                Some(touch.id)
+            }
+            _ => None,
+        };
         let event = match event {
             PlatformInput::TouchDragCandidateProbe(probe) => {
                 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -5521,6 +5551,48 @@ impl Window {
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
         // is the last chance for drag listeners to see the pointer leave and reset their state.
         self.promote_external_drag_to_platform(&event, cx);
+
+        let has_touch_drag_start = touch_drag_start.is_some();
+        if let Some(touch_id) = touch_drag_terminal {
+            if let Some(index) = self
+                .touch_drag_activations
+                .iter()
+                .position(|(candidate_id, _, _, _)| *candidate_id == Some(touch_id))
+            {
+                let _ = self.touch_drag_activations.remove(index);
+            }
+        }
+
+        if let Some((touch_id, Some(target), Some(cursor_offset))) = touch_drag_start
+            && let Some((candidate_id, _, _, _)) = self.touch_drag_activations.iter_mut().find(
+                |(candidate_id, candidate_target, candidate_offset, _)| {
+                    candidate_id.is_none()
+                        && candidate_target == &target
+                        && *candidate_offset == cursor_offset
+                },
+            )
+        {
+            *candidate_id = Some(touch_id);
+        }
+
+        // Windows probes the current contact immediately before its Started event. If any other
+        // input arrives first, an unbound callback belongs to a probe that never became a contact.
+        if !has_touch_drag_start {
+            self.touch_drag_activations
+                .retain(|(touch_id, _, _, _)| touch_id.is_some());
+        }
+
+        if let Some(probe) = touch_drag_candidate_probe.as_ref()
+            && probe.is_candidate()
+            && let (Some(target), Some(cursor_offset), Some(handler)) = (
+                probe.target(),
+                probe.drag_cursor_offset(),
+                probe.take_drag_start_handler(),
+            )
+        {
+            self.touch_drag_activations
+                .push((None, target, cursor_offset, handler));
+        }
 
         self.file_drop_context = previous_file_drop_context;
 
@@ -5825,6 +5897,23 @@ impl Window {
             if !cx.propagate_event {
                 break;
             }
+        }
+
+        // A virtualized source can leave the rendered frame between contact down and touch slop.
+        // Keep the accepted activation callback on the window so the original drag still starts.
+        if cx.propagate_event
+            && let Some(touch_drag) = event.downcast_ref::<crate::TouchDragEvent>()
+            && touch_drag.phase == crate::TouchPhase::Started
+            && let Some(index) = self.touch_drag_activations.iter().position(
+                |(touch_id, target, cursor_offset, _)| {
+                    *touch_id == Some(touch_drag.id)
+                        && Some(target) == touch_drag.target.as_ref()
+                        && Some(*cursor_offset) == touch_drag.cursor_offset
+                },
+            )
+        {
+            let (_, _, _, mut handler) = self.touch_drag_activations.remove(index);
+            handler(touch_drag, DispatchPhase::Bubble, self, cx);
         }
 
         // Bubble phase, where most normal handlers do their work.
@@ -7645,12 +7734,12 @@ mod tests {
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropContext, FileDropEffect,
-        FileDropEvent, FileDropResponse, FocusHandle, InputEvent as _, InteractiveElement as _,
-        IntoElement, KeyDownEvent, Keystroke, LocalDragSessionToken, LongPressEvent, MouseButton,
-        MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
-        Render, RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext,
-        TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, WindowAppearance, WindowOptions,
-        canvas, div, point, px, size,
+        FileDropEvent, FileDropResponse, FocusHandle, GlobalElementId, InputEvent as _,
+        InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, LocalDragSessionToken,
+        LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+        Pixels, PlatformInput, Point, Render, RequestFrameOptions, StatefulInteractiveElement as _,
+        Styled, TestAppContext, TouchDragCandidateProbe, TouchDragEvent, TouchEvent, TouchId,
+        TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
 
     /// Visibility transitions reach observers exactly once each, with the new
@@ -8700,6 +8789,96 @@ mod tests {
                 (TouchPhase::Ended, px(40.)),
             ]
         );
+    }
+
+    #[gpui::test]
+    fn abandoned_touch_drag_probe_cannot_bind_to_a_later_contact(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let any_window = AnyWindowHandle::from(window);
+        let target = GlobalElementId::default();
+        let cursor_offset = point(px(4.), px(6.));
+        let stale_handler_called = Rc::new(Cell::new(false));
+        let current_handler_called = Rc::new(Cell::new(false));
+
+        cx.update_window(any_window, |_, window, cx| {
+            let abandoned_probe = TouchDragCandidateProbe::new(point(px(10.), px(12.)));
+            assert!(abandoned_probe.reserve(target.clone()));
+            abandoned_probe.accept_with_cursor_offset(cursor_offset);
+            let stale_called = stale_handler_called.clone();
+            abandoned_probe.retain_drag_start_handler(move |_, _, _, _| {
+                stale_called.set(true);
+            });
+            window.dispatch_event(abandoned_probe.to_platform_input(), cx);
+            assert_eq!(window.touch_drag_activations.len(), 1);
+
+            // A probe that never receives Started is released on the next unrelated input.
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(11.), px(12.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(window.touch_drag_activations.is_empty());
+
+            let abandoned_probe = TouchDragCandidateProbe::new(point(px(10.), px(12.)));
+            assert!(abandoned_probe.reserve(target.clone()));
+            abandoned_probe.accept_with_cursor_offset(cursor_offset);
+            let stale_called = stale_handler_called.clone();
+            abandoned_probe.retain_drag_start_handler(move |_, _, _, _| {
+                stale_called.set(true);
+            });
+            window.dispatch_event(abandoned_probe.to_platform_input(), cx);
+            assert_eq!(window.touch_drag_activations.len(), 1);
+
+            // Native Windows probes again for each pointer-down, before its Started event.
+            let current_probe = TouchDragCandidateProbe::new(point(px(10.), px(12.)));
+            assert!(current_probe.reserve(target.clone()));
+            current_probe.accept_with_cursor_offset(cursor_offset);
+            let current_handler_called = current_handler_called.clone();
+            current_probe.retain_drag_start_handler(move |_, _, _, _| {
+                current_handler_called.set(true);
+            });
+            window.dispatch_event(current_probe.to_platform_input(), cx);
+            assert_eq!(window.touch_drag_activations.len(), 1);
+
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: TouchId(71),
+                    phase: TouchPhase::Started,
+                    position: point(px(10.), px(12.)),
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: true,
+                    drag_target: Some(target),
+                    drag_cursor_offset: Some(cursor_offset),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: TouchId(71),
+                    phase: TouchPhase::Moved,
+                    position: point(px(10.), px(42.)),
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: false,
+                    drag_target: None,
+                    drag_cursor_offset: None,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+
+        assert!(!stale_handler_called.get());
+        assert!(current_handler_called.get());
     }
 
     struct TouchDragListener {
