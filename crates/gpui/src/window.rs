@@ -803,6 +803,19 @@ impl HitboxId {
         false
     }
 
+    pub(crate) fn is_hovered_at_in_next_frame(
+        self,
+        position: Point<Pixels>,
+        window: &Window,
+    ) -> bool {
+        let hit_test = window.next_frame.hit_test(position);
+        hit_test
+            .ids
+            .iter()
+            .take(hit_test.hover_hitbox_count)
+            .any(|id| self == *id)
+    }
+
     /// Checks if the hitbox with this ID contains the mouse and should handle scroll events.
     /// Typically this should only be used when handling `ScrollWheelEvent`, and otherwise
     /// `is_hovered` should be used. See the documentation of `Hitbox::is_hovered` for details about
@@ -856,6 +869,19 @@ impl Hitbox {
     /// modality or mouse position.
     pub fn is_hovered_at(&self, position: Point<Pixels>, window: &Window) -> bool {
         let hit_test = window.rendered_frame.hit_test(position);
+        hit_test
+            .ids
+            .iter()
+            .take(hit_test.hover_hitbox_count)
+            .any(|id| self.id == *id)
+    }
+
+    pub(crate) fn is_hovered_at_in_next_frame(
+        &self,
+        position: Point<Pixels>,
+        window: &Window,
+    ) -> bool {
+        let hit_test = window.next_frame.hit_test(position);
         hit_test
             .ids
             .iter()
@@ -1215,6 +1241,7 @@ pub struct Window {
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_drag_handoff: Option<crate::TouchId>,
+    touch_drag_move_dispatch: Option<crate::TouchId>,
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
@@ -2082,6 +2109,7 @@ impl Window {
                     .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
             ),
             touch_drag_handoff: None,
+            touch_drag_move_dispatch: None,
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
@@ -3102,6 +3130,10 @@ impl Window {
         self.mouse_position
     }
 
+    pub(crate) fn is_dispatching_touch_drag_move(&self, touch_id: crate::TouchId) -> bool {
+        self.touch_drag_move_dispatch == Some(touch_id)
+    }
+
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
     /// events will be routed to listeners that check this hitbox's `is_hovered` status,
     /// regardless of actual hit testing. This enables drag operations that continue
@@ -3462,7 +3494,8 @@ impl Window {
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
             let mut element = active_drag.view.clone().into_any_element();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
+            let mouse_position = self.mouse_position();
+            let offset = active_drag.preview_position(mouse_position) - active_drag.cursor_offset;
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
@@ -5477,6 +5510,7 @@ impl Window {
                             cursor_style: None,
                             external_payload_source: None,
                             source: crate::MouseInputSource::Unknown,
+                            touch_preview_position: None,
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -5783,18 +5817,14 @@ impl Window {
                     .as_ref()
                     .is_some_and(|drag| drag.source == crate::MouseInputSource::Touch)
                 {
+                    if let Some(drag) = cx.active_drag.as_mut() {
+                        drag.update_touch_preview_position(touch_drag.id, touch_drag.position);
+                    }
                     self.mouse_position = touch_drag.position;
                     match touch_drag.phase {
                         crate::TouchPhase::Started | crate::TouchPhase::Moved => {
                             cx.propagate_event = true;
-                            self.dispatch_mouse_event(
-                                &crate::MouseMoveEvent {
-                                    position: touch_drag.position,
-                                    pressed_button: Some(crate::MouseButton::Left),
-                                    modifiers: self.modifiers,
-                                },
-                                cx,
-                            );
+                            self.dispatch_touch_drag_mouse_move(&touch_drag, cx);
                         }
                         crate::TouchPhase::Ended => {
                             cx.propagate_event = true;
@@ -5807,17 +5837,19 @@ impl Window {
                                 },
                                 cx,
                             );
-                            if cx
-                                .active_drag
-                                .as_ref()
-                                .is_some_and(|drag| drag.source == crate::MouseInputSource::Touch)
-                            {
-                                cx.active_drag.take();
+                            if let Some(drag) = cx.active_drag.as_mut() {
+                                if drag.clear_touch_preview_position(touch_drag.id) {
+                                    cx.active_drag.take();
+                                }
                             }
                             self.refresh();
                         }
                         crate::TouchPhase::Cancelled => {
-                            cx.active_drag.take();
+                            if let Some(drag) = cx.active_drag.as_mut() {
+                                if drag.clear_touch_preview_position(touch_drag.id) {
+                                    cx.active_drag.take();
+                                }
+                            }
                             self.refresh();
                         }
                     }
@@ -5849,6 +5881,21 @@ impl Window {
                 }
             }
         }
+    }
+
+    fn dispatch_touch_drag_mouse_move(&mut self, touch_drag: &crate::TouchDragEvent, cx: &mut App) {
+        let previous_touch_drag_move_dispatch =
+            self.touch_drag_move_dispatch.replace(touch_drag.id);
+        self.dispatch_mouse_event(
+            &crate::MouseMoveEvent {
+                position: touch_drag.position,
+                pressed_button: Some(crate::MouseButton::Left),
+                modifiers: self.modifiers,
+            },
+            cx,
+        );
+        // A nested dispatch may install its own origin; restore the enclosing contact afterward.
+        self.touch_drag_move_dispatch = previous_touch_drag_move_dispatch;
     }
 
     fn schedule_long_press_timer(&mut self, cx: &mut App) {
@@ -7734,12 +7781,13 @@ mod tests {
         cell::{Cell, RefCell},
         path::PathBuf,
         rc::Rc,
+        sync::Arc,
         time::Duration,
     };
 
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
-        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropContext, FileDropEffect,
+        AnyDrag, AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent,
+        Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropContext, FileDropEffect,
         FileDropEvent, FileDropResponse, FocusHandle, GlobalElementId, InputEvent as _,
         InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, LocalDragSessionToken,
         LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
@@ -8795,6 +8843,138 @@ mod tests {
                 (TouchPhase::Ended, px(40.)),
             ]
         );
+    }
+
+    struct DragMoveObserver(Rc<RefCell<Vec<Point<Pixels>>>>);
+
+    impl Render for DragMoveObserver {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let drag_moves = self.0.clone();
+            div()
+                .size_full()
+                .on_drag_move(move |event: &DragMoveEvent<String>, _, _| {
+                    drag_moves.borrow_mut().push(event.event.position);
+                })
+        }
+    }
+
+    struct DragOverTargetObserver(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Render for DragOverTargetObserver {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mouse_target_hits = self.0.clone();
+            let touch_target_hits = self.0.clone();
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(0.))
+                        .size(px(40.))
+                        .drag_over::<String>(move |style, _, _, _| {
+                            mouse_target_hits.borrow_mut().push("mouse");
+                            style
+                        }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(60.))
+                        .top(px(0.))
+                        .size(px(40.))
+                        .group("touch-target")
+                        .drag_over::<String>(move |style, _, _, _| {
+                            touch_target_hits.borrow_mut().push("touch");
+                            style
+                        })
+                        .group_drag_over::<String>("touch-target", |style| style),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn touch_drag_moves_only_for_the_recognized_contact(cx: &mut TestAppContext) {
+        let drag_moves = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let drag_moves = drag_moves.clone();
+            move |_, _| DragMoveObserver(drag_moves)
+        });
+        let touch_id = TouchId(9);
+        let touch_position = point(px(70.), px(80.));
+        let stale_position = point(px(5.), px(6.));
+
+        cx.update_window(AnyWindowHandle::from(window), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            cx.active_drag = Some(AnyDrag {
+                view: cx.new(|_| Empty).into(),
+                value: Arc::new(String::from("touch payload")),
+                cursor_offset: point(px(0.), px(0.)),
+                cursor_style: None,
+                external_payload_source: None,
+                source: crate::MouseInputSource::Touch,
+                touch_preview_position: Some((touch_id, touch_position)),
+            });
+
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: stale_position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+
+            assert_eq!(window.mouse_position(), stale_position);
+            assert!(drag_moves.borrow().is_empty());
+
+            window.dispatch_recognized_touch_gesture(
+                crate::gestures::RecognizedTouchGesture::TouchDrag(TouchDragEvent {
+                    id: touch_id,
+                    phase: TouchPhase::Moved,
+                    start_position: point(px(10.), px(20.)),
+                    position: touch_position,
+                    target: None,
+                    cursor_offset: None,
+                }),
+                cx,
+            );
+            assert_eq!(window.mouse_position(), touch_position);
+        })
+        .unwrap();
+
+        assert_eq!(drag_moves.borrow().as_slice(), [touch_position]);
+    }
+
+    #[gpui::test]
+    fn touch_drag_over_styles_use_current_frame_contact_hit_test(cx: &mut TestAppContext) {
+        let target_hits = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let target_hits = target_hits.clone();
+            move |_, _| DragOverTargetObserver(target_hits)
+        });
+        let mouse_position = point(px(10.), px(10.));
+        let touch_position = point(px(70.), px(10.));
+
+        cx.update_window(AnyWindowHandle::from(window), |_, window, cx| {
+            window.mouse_position = mouse_position;
+            window.draw(cx).clear(cx);
+            cx.active_drag = Some(AnyDrag {
+                view: cx.new(|_| Empty).into(),
+                value: Arc::new(String::from("touch payload")),
+                cursor_offset: point(px(0.), px(0.)),
+                cursor_style: None,
+                external_payload_source: None,
+                source: crate::MouseInputSource::Touch,
+                touch_preview_position: Some((TouchId(10), touch_position)),
+            });
+            window.draw(cx).clear(cx);
+            assert_eq!(window.mouse_position(), mouse_position);
+        })
+        .unwrap();
+
+        assert_eq!(target_hits.borrow().as_slice(), ["touch"]);
     }
 
     #[gpui::test]

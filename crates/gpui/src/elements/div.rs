@@ -387,6 +387,10 @@ impl Interactivity {
                 if phase == DispatchPhase::Capture
                     && let Some(drag) = &cx.active_drag
                     && drag.value.as_ref().type_id() == TypeId::of::<T>()
+                    && (drag.source != crate::MouseInputSource::Touch
+                        || drag.touch_preview_position.is_some_and(|(touch_id, _)| {
+                            window.is_dispatching_touch_drag_move(touch_id)
+                        }))
                 {
                     (listener)(
                         &DragMoveEvent {
@@ -3249,6 +3253,7 @@ impl Interactivity {
                                 cursor_style: drag_cursor_style,
                                 external_payload_source,
                                 source: mouse_down.source,
+                                touch_preview_position: None,
                             });
                             pending_mouse_down.take();
                             window.refresh();
@@ -3742,6 +3747,7 @@ impl Interactivity {
 
         if let Some(hitbox) = hitbox {
             if let Some(drag) = cx.active_drag.take() {
+                let drag_position = drag.preview_position(window.mouse_position());
                 let mut can_drop = true;
                 if let Some(can_drop_predicate) = &self.can_drop_predicate {
                     can_drop = can_drop_predicate(drag.value.as_ref(), window, cx);
@@ -3752,14 +3758,15 @@ impl Interactivity {
                         if let Some(group_hitbox_id) =
                             GroupHitboxes::get(&group_drag_style.group, cx)
                             && *state_type == drag.value.as_ref().type_id()
-                            && group_hitbox_id.is_hovered(window)
+                            && group_hitbox_id.is_hovered_at_in_next_frame(drag_position, window)
                         {
                             style.refine(&group_drag_style.style);
                         }
                     }
 
                     for (state_type, build_drag_over_style) in &self.drag_over_styles {
-                        if *state_type == drag.value.as_ref().type_id() && hitbox.is_hovered(window)
+                        if *state_type == drag.value.as_ref().type_id()
+                            && hitbox.is_hovered_at_in_next_frame(drag_position, window)
                         {
                             style.refine(&build_drag_over_style(drag.value.as_ref(), window, cx));
                         }
@@ -3920,6 +3927,7 @@ fn start_touch_drag(
         cursor_style: drag_cursor_style,
         external_payload_source,
         source: MouseInputSource::Touch,
+        touch_preview_position: None,
     });
     window.refresh();
     cx.stop_propagation();

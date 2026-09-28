@@ -3119,6 +3119,53 @@ pub struct AnyDrag {
     pub external_payload_source: Option<ExternalDragPayloadSource>,
     /// Provenance of the input stream that started this drag.
     pub source: crate::MouseInputSource,
+
+    /// The latest position of the touch contact that owns this preview.
+    ///
+    /// Mouse events still update window hit-testing, but must not move a touch preview.
+    pub touch_preview_position: Option<(crate::TouchId, Point<Pixels>)>,
+}
+
+impl AnyDrag {
+    pub(crate) fn preview_position(&self, mouse_position: Point<Pixels>) -> Point<Pixels> {
+        if self.source == crate::MouseInputSource::Touch {
+            if let Some((_, position)) = self.touch_preview_position {
+                return position;
+            }
+        }
+        mouse_position
+    }
+
+    pub(crate) fn update_touch_preview_position(
+        &mut self,
+        touch_id: crate::TouchId,
+        position: Point<Pixels>,
+    ) -> bool {
+        if self.source != crate::MouseInputSource::Touch {
+            return false;
+        }
+
+        match self.touch_preview_position {
+            Some((active_touch_id, _)) if active_touch_id != touch_id => false,
+            _ => {
+                self.touch_preview_position = Some((touch_id, position));
+                true
+            }
+        }
+    }
+
+    pub(crate) fn clear_touch_preview_position(&mut self, touch_id: crate::TouchId) -> bool {
+        if self.source == crate::MouseInputSource::Touch
+            && self
+                .touch_preview_position
+                .is_some_and(|(active_touch_id, _)| active_touch_id == touch_id)
+        {
+            self.touch_preview_position = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Lazily resolves the payload handed to the platform when an internal drag is
@@ -3244,10 +3291,69 @@ mod test {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
+    use super::*;
     use crate::{
         AppContext, Context, Empty, FallbackFontClass, IntoElement, MissingGlyph, Render,
-        TestAppContext, Window,
+        TestAppContext, Window, point, px,
     };
+
+    #[gpui::test]
+    fn touch_drag_preview_ignores_mouse_moves_and_tracks_its_contact(cx: &mut TestAppContext) {
+        let mut drag = cx.update(|cx| AnyDrag {
+            view: cx.new(|_| Empty).into(),
+            value: Arc::new(()),
+            cursor_offset: point(px(0.), px(0.)),
+            cursor_style: None,
+            external_payload_source: None,
+            source: crate::MouseInputSource::Touch,
+            touch_preview_position: None,
+        });
+        let touch_id = crate::TouchId(42);
+        let first_touch_position = point(px(30.), px(40.));
+        let later_touch_position = point(px(70.), px(80.));
+        let stale_mouse_position = point(px(5.), px(6.));
+
+        assert!(drag.update_touch_preview_position(touch_id, first_touch_position));
+        assert_eq!(
+            drag.preview_position(stale_mouse_position),
+            first_touch_position
+        );
+        assert!(!drag.update_touch_preview_position(crate::TouchId(7), stale_mouse_position));
+        assert_eq!(
+            drag.preview_position(stale_mouse_position),
+            first_touch_position
+        );
+        assert!(drag.update_touch_preview_position(touch_id, later_touch_position));
+        assert_eq!(
+            drag.preview_position(stale_mouse_position),
+            later_touch_position
+        );
+        assert!(!drag.clear_touch_preview_position(crate::TouchId(7)));
+        assert_eq!(
+            drag.preview_position(stale_mouse_position),
+            later_touch_position
+        );
+        assert!(drag.clear_touch_preview_position(touch_id));
+        assert_eq!(
+            drag.preview_position(stale_mouse_position),
+            stale_mouse_position
+        );
+    }
+
+    #[gpui::test]
+    fn non_touch_drag_preview_uses_mouse_position(cx: &mut TestAppContext) {
+        let drag = cx.update(|cx| AnyDrag {
+            view: cx.new(|_| Empty).into(),
+            value: Arc::new(()),
+            cursor_offset: point(px(0.), px(0.)),
+            cursor_style: None,
+            external_payload_source: None,
+            source: crate::MouseInputSource::Mouse,
+            touch_preview_position: Some((crate::TouchId(42), point(px(30.), px(40.)))),
+        });
+        let mouse_position = point(px(5.), px(6.));
+        assert_eq!(drag.preview_position(mouse_position), mouse_position);
+    }
 
     struct RenderCounter(Rc<Cell<usize>>);
 
