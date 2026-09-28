@@ -155,9 +155,37 @@ impl DirectManipulationHandler {
         }
     }
 
+    /// Stop scroll inertia before a touch contact becomes GPUI-owned.
+    ///
+    /// Native scrolling normally interrupts inertia through `SetContact`. A selected-item drag
+    /// deliberately stays out of Direct Manipulation, so it needs to end the previous scroll
+    /// sequence explicitly or the old vertical inertia keeps moving underneath the drag.
+    pub fn stop_inertia_for_gpui_contact(&self) {
+        if !self.native_touch {
+            return;
+        }
+
+        unsafe {
+            // 最新の慣性位置を先に取り込み、Stop 後の Ended と transform reset も反映する。
+            self.update_manager.Update(None).log_err();
+            if self
+                .viewport
+                .GetStatus()
+                .is_ok_and(should_stop_for_gpui_contact)
+            {
+                self.viewport.Stop().log_err();
+                self.update_manager.Update(None).log_err();
+            }
+        }
+    }
+
     pub fn drain_events(&self) -> Vec<PlatformInput> {
         std::mem::take(&mut *self.pending_events.borrow_mut())
     }
+}
+
+pub(super) fn should_stop_for_gpui_contact(status: DIRECTMANIPULATION_STATUS) -> bool {
+    status == DIRECTMANIPULATION_INERTIA
 }
 
 impl Drop for DirectManipulationHandler {

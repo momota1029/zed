@@ -8859,6 +8859,20 @@ mod tests {
                 .to_platform_input(),
                 cx,
             );
+            // Windows may deliver the final native inertia updates after Touch Started
+            // binds this retained callback to the contact, but before touch slop is crossed.
+            for touch_phase in [TouchPhase::Moved, TouchPhase::Ended] {
+                window.dispatch_event(
+                    crate::ScrollWheelEvent {
+                        position: point(px(10.), px(12.)),
+                        delta: crate::ScrollDelta::Pixels(point(px(0.), px(-8.))),
+                        modifiers: Default::default(),
+                        touch_phase,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            }
             window.dispatch_event(
                 TouchEvent {
                     timestamp: None,

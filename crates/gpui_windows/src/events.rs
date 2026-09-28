@@ -449,18 +449,42 @@ impl WindowsWindowInner {
             }
             WM_MOUSEWHEEL => self.handle_mouse_wheel_msg(handle, wparam, lparam),
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
-            WM_POINTERDOWN if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Started, None, false, None)
-            }
+            WM_POINTERDOWN if self.state.touch_input_mode == TouchInputMode::RawGpui => self
+                .handle_pointer_msg(
+                    handle,
+                    wparam,
+                    TouchPhase::Started,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
             WM_POINTERDOWN if self.state.touch_input_mode == TouchInputMode::Native => {
                 self.handle_native_pointer_down(handle, wparam)
             }
-            WM_POINTERUPDATE if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Moved, None, false, None)
-            }
-            WM_POINTERUP if self.state.touch_input_mode == TouchInputMode::RawGpui => {
-                self.handle_pointer_msg(handle, wparam, TouchPhase::Ended, None, false, None)
-            }
+            WM_POINTERUPDATE if self.state.touch_input_mode == TouchInputMode::RawGpui => self
+                .handle_pointer_msg(
+                    handle,
+                    wparam,
+                    TouchPhase::Moved,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            WM_POINTERUP if self.state.touch_input_mode == TouchInputMode::RawGpui => self
+                .handle_pointer_msg(
+                    handle,
+                    wparam,
+                    TouchPhase::Ended,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
             WM_POINTERUPDATE | WM_POINTERUP
                 if self.state.touch_input_mode == TouchInputMode::Native
                     && self
@@ -479,6 +503,8 @@ impl WindowsWindowInner {
                     },
                     None,
                     false,
+                    None,
+                    None,
                     None,
                 )
             }
@@ -503,6 +529,8 @@ impl WindowsWindowInner {
                         TouchPhase::Cancelled,
                         None,
                         false,
+                        None,
+                        None,
                         None,
                     )
                 } else {
@@ -831,14 +859,27 @@ impl WindowsWindowInner {
         if let Some((target, drag_candidate, drag_cursor_offset)) =
             self.dispatch_touch_drag_candidate_probe(position)
         {
-            self.handle_pointer_msg(
+            let result = self.handle_pointer_msg(
                 handle,
                 wparam,
                 TouchPhase::Started,
                 Some(target),
                 drag_candidate,
                 drag_cursor_offset,
-            )
+                Some(pointer_info),
+                Some(position),
+            );
+
+            // Touch Started が候補を接触 ID に結び付けてから慣性を止める。先に
+            // Scroll Moved/Ended を流すと GPUI が未結合の候補を破棄してしまう。
+            if self.state.touch_state.borrow().is_claimed(pointer_id) {
+                self.state
+                    .direct_manipulation
+                    .stop_inertia_for_gpui_contact();
+                self.dispatch_direct_manipulation_events();
+            }
+
+            result
         } else {
             self.state
                 .touch_state
@@ -846,6 +887,20 @@ impl WindowsWindowInner {
                 .mark_native_contact(pointer_id);
             self.state.direct_manipulation.on_pointer_down(wparam);
             None
+        }
+    }
+
+    fn dispatch_direct_manipulation_events(&self) {
+        let events = self.state.direct_manipulation.drain_events();
+        if events.is_empty() {
+            return;
+        }
+
+        if let Some(mut func) = self.state.callbacks.input.take() {
+            for event in events {
+                func(event);
+            }
+            self.state.callbacks.input.set(Some(func));
         }
     }
 
@@ -876,13 +931,21 @@ impl WindowsWindowInner {
         drag_target: Option<gpui::GlobalElementId>,
         drag_candidate: bool,
         drag_cursor_offset: Option<Point<Pixels>>,
+        pointer_info: Option<POINTER_INFO>,
+        down_position: Option<Point<Pixels>>,
     ) -> Option<isize> {
         let pointer_id = wparam.loword() as u32;
-        let mut pointer_info = POINTER_INFO::default();
-        if let Err(error) = unsafe { GetPointerInfo(pointer_id, &mut pointer_info) } {
-            log::error!("failed to get pointer information: {error}");
-            return self.cancel_active_touch(pointer_id, true);
-        }
+        let pointer_info = match pointer_info {
+            Some(pointer_info) => pointer_info,
+            None => {
+                let mut pointer_info = POINTER_INFO::default();
+                if let Err(error) = unsafe { GetPointerInfo(pointer_id, &mut pointer_info) } {
+                    log::error!("failed to get pointer information: {error}");
+                    return self.cancel_active_touch(pointer_id, true);
+                }
+                pointer_info
+            }
+        };
 
         if pointer_info.pointerType != PT_TOUCH {
             if self.state.touch_state.borrow().is_claimed(pointer_id) {
@@ -913,6 +976,7 @@ impl WindowsWindowInner {
                             drag_target.clone(),
                             drag_candidate,
                             drag_cursor_offset,
+                            None,
                             index + 1 == sample_count,
                         );
                         // Leave unclaimed contacts to the OS even when history is available.
@@ -932,6 +996,7 @@ impl WindowsWindowInner {
             drag_target,
             drag_candidate,
             drag_cursor_offset,
+            down_position,
             true,
         )
     }
@@ -945,13 +1010,16 @@ impl WindowsWindowInner {
         drag_target: Option<gpui::GlobalElementId>,
         drag_candidate: bool,
         drag_cursor_offset: Option<Point<Pixels>>,
+        down_position: Option<Point<Pixels>>,
         predict: bool,
     ) -> Option<isize> {
         let timestamp = pointer_sample_time(&pointer_info);
 
         // Windows adjusts ptPixelLocation with its input prediction. Gesture
         // classification and hit testing must use the unadjusted digitizer point.
-        let Some(position) = self.pointer_position(handle, pointer_info.ptPixelLocationRaw) else {
+        let Some(position) = down_position
+            .or_else(|| self.pointer_position(handle, pointer_info.ptPixelLocationRaw))
+        else {
             return self.cancel_active_touch(pointer_id, true);
         };
         let predicted_position = if phase == TouchPhase::Moved && predict {
@@ -2035,16 +2103,7 @@ impl WindowsWindowInner {
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
         self.state.direct_manipulation.update();
-
-        let events = self.state.direct_manipulation.drain_events();
-        if !events.is_empty() {
-            if let Some(mut func) = self.state.callbacks.input.take() {
-                for event in events {
-                    func(event);
-                }
-                self.state.callbacks.input.set(Some(func));
-            }
-        }
+        self.dispatch_direct_manipulation_events();
 
         let force_render = force_render || self.state.force_render_pending.take();
         if force_render {
@@ -2571,5 +2630,17 @@ mod tests {
         assert!(cancelled.is_none());
         assert!(claimed);
         assert!(!state.is_claimed(11));
+    }
+
+    #[test]
+    fn gpui_touch_contact_stops_only_direct_manipulation_inertia() {
+        use crate::direct_manipulation::should_stop_for_gpui_contact;
+        use windows::Win32::Graphics::DirectManipulation::{
+            DIRECTMANIPULATION_INERTIA, DIRECTMANIPULATION_READY, DIRECTMANIPULATION_RUNNING,
+        };
+
+        assert!(should_stop_for_gpui_contact(DIRECTMANIPULATION_INERTIA));
+        assert!(!should_stop_for_gpui_contact(DIRECTMANIPULATION_RUNNING));
+        assert!(!should_stop_for_gpui_contact(DIRECTMANIPULATION_READY));
     }
 }
