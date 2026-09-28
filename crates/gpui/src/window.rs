@@ -5354,7 +5354,9 @@ impl Window {
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
-            PlatformInput::Touch(_) => InputModality::Touch,
+            PlatformInput::Touch(_) | PlatformInput::TouchDragCandidateProbe(_) => {
+                InputModality::Touch
+            }
             _ => self.last_input_modality,
         };
         if self.last_input_modality != old_modality {
@@ -5399,6 +5401,10 @@ impl Window {
                 let allow_probe = !self.is_inspector_picking(cx);
                 #[cfg(not(any(feature = "inspector", debug_assertions)))]
                 let allow_probe = true;
+                // This probe is the native touch contact-down boundary, even though candidate
+                // listeners are routed through the mouse hit-test path. Keep hit-testing the
+                // rendered frame that is currently visible; queued layout changes will take effect
+                // with the next presented frame.
                 if allow_probe {
                     let previous_mouse_position =
                         std::mem::replace(&mut self.mouse_position, probe.position());

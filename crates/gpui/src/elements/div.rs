@@ -4891,6 +4891,53 @@ mod tests {
     }
 
     #[gpui::test]
+    fn touch_drag_probe_counts_as_touch_after_keyboard_scroll_input(cx: &mut TestAppContext) {
+        let cursor_offset = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let cursor_offset = cursor_offset.clone();
+            move |_, _| TouchDragMovedRow {
+                moved: false,
+                unmounted: false,
+                cursor_offset,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                KeyDownEvent {
+                    keystroke: Keystroke::parse("a").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: point(px(18.), px(27.)),
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(-12.))),
+                    modifiers: Default::default(),
+                    touch_phase: TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(window.last_input_was_keyboard());
+
+            let probe = TouchDragCandidateProbe::new(point(px(18.), px(27.)));
+            let result = window.dispatch_event(probe.to_platform_input(), cx);
+            assert!(result.touch_drag_candidate);
+            assert!(!window.last_input_was_keyboard());
+            assert!(result.touch_drag_target.is_some());
+            assert_eq!(result.touch_drag_cursor_offset, Some(point(px(8.), px(7.))));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
     fn touch_drag_after_source_unmount_uses_retained_activation(cx: &mut TestAppContext) {
         let cursor_offset = Rc::new(Cell::new(None));
         let window = cx.add_window({
