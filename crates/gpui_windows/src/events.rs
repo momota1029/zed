@@ -115,19 +115,23 @@ struct DrawWindowGuard<'a> {
 const MI_WP_SIGNATURE_MASK: usize = 0xffff_ff00;
 const MI_WP_SIGNATURE: usize = 0xff51_5700;
 const MI_WP_FLAG_TOUCH: usize = 0x80;
-const MI_WP_FLAG_PEN: usize = 0x40;
 const PROMOTED_TOUCH_DOUBLE_CLICK_SLOP_LOGICAL: f32 = 16.0;
 
 fn mouse_input_source_from_message() -> MouseInputSource {
     let extra_info = unsafe { GetMessageExtraInfo().0 as usize };
+    mouse_input_source_from_extra_info(extra_info)
+}
+
+fn mouse_input_source_from_extra_info(extra_info: usize) -> MouseInputSource {
     if (extra_info & MI_WP_SIGNATURE_MASK) != MI_WP_SIGNATURE {
         return MouseInputSource::Mouse;
     }
 
-    match extra_info & (MI_WP_FLAG_TOUCH | MI_WP_FLAG_PEN) {
-        MI_WP_FLAG_TOUCH => MouseInputSource::Touch,
-        MI_WP_FLAG_PEN => MouseInputSource::Pen,
-        _ => MouseInputSource::Unknown,
+    // 下位 7 bit は cursor ID。0x40 を pen flag と読むと一部の touch を誤分類する。
+    if extra_info & MI_WP_FLAG_TOUCH != 0 {
+        MouseInputSource::Touch
+    } else {
+        MouseInputSource::Pen
     }
 }
 
@@ -147,6 +151,17 @@ pub(crate) struct WindowsTouchState {
     claimed: HashSet<u32>,
     next_id: u64,
     promoted: Option<PromotedTouch>,
+    compatibility: Option<CompatibilityTouch>,
+}
+
+// GPUI がジェスチャを所有したまま、Windows に OLE 用の mouse 列だけを生成させる。
+// mouse メッセージには pointer ID がないため、単一の primary 接触だけを対応付ける。
+struct CompatibilityTouch {
+    pointer_id: u32,
+    touch_id: TouchId,
+    mouse_down: bool,
+    terminal: bool,
+    invalid: bool,
 }
 
 struct PromotedTouch {
@@ -158,12 +173,127 @@ struct PromotedTouch {
 }
 
 impl WindowsTouchState {
+    fn prepare_new_pointer_down(&mut self, pointer_id: u32, primary: bool) {
+        // OLE の modal loop が terminal を消費した場合、次の primary DOWN が新世代の証拠。
+        // Escape 後に同じ指を保持中の UPDATE や、二本目の非 primary DOWN では消さない。
+        if let Some(previous) = self
+            .promoted
+            .as_ref()
+            .filter(|touch| !touch.ole_active && (touch.pointer_id == pointer_id || primary))
+            .map(|touch| touch.pointer_id)
+        {
+            self.finish_promoted_pointer(previous, true);
+        }
+        if self.promoted.is_none()
+            && self
+                .compatibility
+                .as_ref()
+                .is_some_and(|touch| touch.terminal)
+        {
+            self.compatibility = None;
+        }
+    }
+
+    pub(crate) fn compatibility_mouse_pending(&self, touch_id: TouchId) -> bool {
+        self.promoted.is_none()
+            && self.active_contacts.len() == 1
+            && self.compatibility.as_ref().is_some_and(|touch| {
+                touch.touch_id == touch_id
+                    && !touch.mouse_down
+                    && !touch.terminal
+                    && !touch.invalid
+                    && self
+                        .active
+                        .get(&touch.pointer_id)
+                        .is_some_and(|active| active.id == touch_id)
+                    && self.claimed.contains(&touch.pointer_id)
+            })
+    }
+
+    pub(crate) fn pending_compatibility_pointer(&self, touch_id: TouchId) -> Option<u32> {
+        self.compatibility_mouse_pending(touch_id)
+            .then(|| self.compatibility.as_ref().map(|touch| touch.pointer_id))
+            .flatten()
+    }
+
+    fn begin_compatibility(&mut self, pointer_id: u32) {
+        if let Some(touch) = self.active.get(&pointer_id) {
+            self.compatibility = Some(CompatibilityTouch {
+                pointer_id,
+                touch_id: touch.id,
+                mouse_down: false,
+                terminal: false,
+                invalid: false,
+            });
+        }
+    }
+
+    fn is_compatibility_pointer(&self, pointer_id: u32) -> bool {
+        self.compatibility
+            .as_ref()
+            .is_some_and(|touch| touch.pointer_id == pointer_id)
+    }
+
+    pub(crate) fn compatibility_mouse_ready(&self, touch_id: TouchId) -> Option<bool> {
+        self.compatibility
+            .as_ref()
+            .filter(|touch| touch.touch_id == touch_id)
+            .map(|touch| {
+                touch.mouse_down
+                    && !touch.terminal
+                    && !touch.invalid
+                    && self.active_contacts.len() == 1
+            })
+    }
+
+    fn finish_compatibility_pointer(&mut self, pointer_id: u32, cancelled: bool) {
+        if let Some(touch) = self
+            .compatibility
+            .as_mut()
+            .filter(|touch| touch.pointer_id == pointer_id)
+        {
+            touch.terminal = true;
+            touch.invalid |= cancelled;
+        }
+    }
+
+    fn compatibility_mouse_message(&mut self, msg: u32) -> Option<ActiveTouch> {
+        let touch = self.compatibility.as_mut()?;
+        if !touch.terminal && self.active_contacts.len() != 1 {
+            touch.invalid = true;
+        }
+        match msg {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if !touch.terminal && !touch.invalid => {
+                touch.mouse_down = true
+            }
+            WM_LBUTTONUP => {
+                touch.mouse_down = false;
+                if touch.terminal && self.promoted.is_none() {
+                    self.compatibility = None;
+                }
+                return None;
+            }
+            _ => {}
+        }
+        // pin の準備が先に終わっていた場合も、互換 DOWN 後の MOVE で移管を再試行する。
+        (msg == WM_MOUSEMOVE
+            && touch.mouse_down
+            && !touch.terminal
+            && !touch.invalid
+            && self.promoted.is_none())
+        .then(|| self.active.get(&touch.pointer_id).cloned())
+        .flatten()
+    }
+
     pub(crate) fn prepare_handoff(
         &mut self,
         touch_id: TouchId,
         cancelled: Arc<AtomicBool>,
     ) -> Option<u32> {
-        if self.promoted.is_some() || self.active_contacts.len() != 1 {
+        if self.promoted.is_some()
+            || self.active_contacts.len() != 1
+            || self.compatibility_mouse_ready(touch_id) == Some(false)
+        {
             return None;
         }
         let (&pointer_id, _) = self.active.iter().find(|(pointer_id, touch)| {
@@ -217,6 +347,7 @@ impl WindowsTouchState {
     }
 
     pub(crate) fn finish_promoted_pointer(&mut self, pointer_id: u32, cancelled: bool) -> bool {
+        self.finish_compatibility_pointer(pointer_id, cancelled);
         let Some(touch) = self
             .promoted
             .as_mut()
@@ -235,6 +366,16 @@ impl WindowsTouchState {
         true
     }
 
+    fn promoted_capture_changed(&mut self, pointer_id: u32, cancelled: Option<bool>) {
+        let compatibility_ole = self.is_compatibility_pointer(pointer_id)
+            && self.promoted.as_ref().is_some_and(|touch| touch.ole_active);
+        // OLE へ渡した互換経路では、pointer capture の移転だけでは mouse 列は終わらない。
+        // 明示 CANCELED 以外は OLE の mouse UP / Escape / source cancel に終端を任せる。
+        if !compatibility_ole || cancelled == Some(true) {
+            self.finish_promoted_pointer(pointer_id, true);
+        }
+    }
+
     fn clear_finished_handoff(&mut self) {
         if self
             .promoted
@@ -242,6 +383,13 @@ impl WindowsTouchState {
             .is_some_and(|touch| !touch.ole_active && touch.terminal)
         {
             self.promoted = None;
+            if self
+                .compatibility
+                .as_ref()
+                .is_some_and(|touch| touch.terminal)
+            {
+                self.compatibility = None;
+            }
         }
     }
 
@@ -275,12 +423,14 @@ impl WindowsTouchState {
     }
 
     fn finish(&mut self, pointer_id: u32) -> Option<ActiveTouch> {
+        self.finish_compatibility_pointer(pointer_id, false);
         self.active_contacts.remove(&pointer_id);
         self.claimed.remove(&pointer_id);
         self.active.remove(&pointer_id)
     }
 
     fn cancel(&mut self, pointer_id: u32, terminal: bool) -> (Option<ActiveTouch>, bool) {
+        self.finish_compatibility_pointer(pointer_id, true);
         let claimed = self.claimed.contains(&pointer_id);
         if terminal {
             self.active_contacts.remove(&pointer_id);
@@ -290,6 +440,13 @@ impl WindowsTouchState {
     }
 
     fn mark_native_contact(&mut self, pointer_id: u32) {
+        if let Some(touch) = self
+            .compatibility
+            .as_mut()
+            .filter(|touch| !touch.terminal && touch.pointer_id != pointer_id)
+        {
+            touch.invalid = true;
+        }
         self.active_contacts.insert(pointer_id);
     }
 
@@ -322,6 +479,28 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if msg == WM_POINTERDOWN {
+            let mut info = POINTER_INFO::default();
+            if unsafe { GetPointerInfo(wparam.loword() as u32, &mut info) }.is_ok()
+                && info.pointerType == PT_TOUCH
+            {
+                self.state
+                    .touch_state
+                    .borrow_mut()
+                    .prepare_new_pointer_down(
+                        info.pointerId,
+                        info.pointerFlags.contains(POINTER_FLAG_PRIMARY),
+                    );
+            }
+        }
+        let compatibility_pointer = matches!(
+            msg,
+            WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERCAPTURECHANGED
+        ) && self
+            .state
+            .touch_state
+            .borrow()
+            .is_compatibility_pointer(wparam.loword() as u32);
         if matches!(
             msg,
             WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERCAPTURECHANGED
@@ -343,10 +522,23 @@ impl WindowsWindowInner {
                         .finish_promoted_pointer(pointer_id, cancelled);
                 }
                 WM_POINTERCAPTURECHANGED => {
+                    let mut info = POINTER_INFO::default();
+                    let result = unsafe { GetPointerInfo(pointer_id, &mut info) };
+                    let cancelled = result
+                        .as_ref()
+                        .ok()
+                        .map(|_| info.pointerFlags.contains(POINTER_FLAG_CANCELED));
+                    if let Err(error) = result {
+                        if std::env::var_os("GPUI_FILE_DROP_TRACE").is_some() {
+                            eprintln!(
+                                "[file-drop] pointer capture changed without pointer info: {error}"
+                            );
+                        }
+                    }
                     self.state
                         .touch_state
                         .borrow_mut()
-                        .finish_promoted_pointer(pointer_id, true);
+                        .promoted_capture_changed(pointer_id, cancelled);
                 }
                 WM_POINTERUPDATE => {
                     let mut info = POINTER_INFO::default();
@@ -361,7 +553,12 @@ impl WindowsWindowInner {
                 }
                 _ => {}
             }
-            return LRESULT(0);
+            // 互換経路では UP も既定処理へ渡す。消すと OLE に mouse UP が届かない。
+            return if compatibility_pointer {
+                unsafe { DefWindowProcW(handle, msg, wparam, lparam) }
+            } else {
+                LRESULT(0)
+            };
         }
 
         let handled = match msg {
@@ -392,9 +589,28 @@ impl WindowsWindowInner {
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
             | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP
             | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP
-                if self.state.touch_state.borrow().has_active_handoff()
+                if (self.state.touch_state.borrow().has_active_handoff()
+                    || self.state.touch_state.borrow().compatibility.is_some())
                     && mouse_input_source_from_message() == MouseInputSource::Touch =>
             {
+                let touch = self
+                    .state
+                    .touch_state
+                    .borrow_mut()
+                    .compatibility_mouse_message(msg);
+                if let Some(touch) = touch {
+                    self.dispatch_touch(TouchEvent {
+                        timestamp: None,
+                        id: touch.id,
+                        phase: TouchPhase::Moved,
+                        position: touch.position,
+                        predicted_position: None,
+                        force: None,
+                        drag_candidate: false,
+                        drag_target: touch.drag_target,
+                        drag_cursor_offset: touch.drag_cursor_offset,
+                    });
+                }
                 // Leave the native message available to the active OLE modal loop,
                 // but never route the promoted contact through GPUI a second time.
                 None
@@ -560,7 +776,9 @@ impl WindowsWindowInner {
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             _ => None,
         };
-        if let Some(n) = handled {
+        if compatibility_pointer {
+            unsafe { DefWindowProcW(handle, msg, wparam, lparam) }
+        } else if let Some(n) = handled {
             LRESULT(n)
         } else {
             unsafe { DefWindowProcW(handle, msg, wparam, lparam) }
@@ -870,6 +1088,16 @@ impl WindowsWindowInner {
                 Some(position),
             );
 
+            let compatibility_candidate = drag_candidate
+                && pointer_info.pointerFlags.contains(POINTER_FLAG_PRIMARY)
+                && self.state.touch_state.borrow().is_claimed(pointer_id);
+            if compatibility_candidate {
+                self.state
+                    .touch_state
+                    .borrow_mut()
+                    .begin_compatibility(pointer_id);
+            }
+
             // Touch Started が候補を接触 ID に結び付けてから慣性を止める。先に
             // Scroll Moved/Ended を流すと GPUI が未結合の候補を破棄してしまう。
             if self.state.touch_state.borrow().is_claimed(pointer_id) {
@@ -879,7 +1107,13 @@ impl WindowsWindowInner {
                 self.dispatch_direct_manipulation_events();
             }
 
-            result
+            // Direct Manipulation 後の ConvertPrimaryPointerToMouseDrag は失敗する場合がある。
+            // 選択候補だけ DOWN から既定処理へ渡し、生成される mouse は境界で二重配送を防ぐ。
+            if compatibility_candidate {
+                None
+            } else {
+                result
+            }
         } else {
             self.state
                 .touch_state
@@ -2559,7 +2793,161 @@ fn notify_frame_changed(handle: HWND) {
 mod tests {
     use gpui::{point, px};
 
-    use super::WindowsTouchState;
+    use super::{
+        MI_WP_FLAG_TOUCH, MI_WP_SIGNATURE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WindowsTouchState, mouse_input_source_from_extra_info,
+    };
+
+    #[test]
+    fn compatibility_source_ignores_all_cursor_id_bits() {
+        for cursor_id in 0..128 {
+            assert_eq!(
+                mouse_input_source_from_extra_info(MI_WP_SIGNATURE | MI_WP_FLAG_TOUCH | cursor_id),
+                gpui::MouseInputSource::Touch
+            );
+            assert_eq!(
+                mouse_input_source_from_extra_info(MI_WP_SIGNATURE | cursor_id),
+                gpui::MouseInputSource::Pen
+            );
+        }
+        assert_eq!(
+            mouse_input_source_from_extra_info(0),
+            gpui::MouseInputSource::Mouse
+        );
+    }
+
+    fn compatibility_contact(state: &mut WindowsTouchState, pointer_id: u32) -> gpui::TouchId {
+        let touch = state
+            .begin(pointer_id, point(px(10.), px(20.)), None, true, None)
+            .unwrap()
+            .0;
+        state.begin_compatibility(pointer_id);
+        touch.id
+    }
+
+    #[test]
+    fn compatibility_handoff_waits_for_this_contacts_mouse_down() {
+        let mut state = WindowsTouchState::default();
+        let id = compatibility_contact(&mut state, 7);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(state.prepare_handoff(id, cancelled.clone()).is_none());
+        state.compatibility_mouse_message(WM_LBUTTONDOWN);
+        assert_eq!(
+            state.compatibility_mouse_message(WM_MOUSEMOVE).unwrap().id,
+            id
+        );
+        assert_eq!(state.prepare_handoff(id, cancelled), Some(7));
+        assert!(state.compatibility_mouse_message(WM_MOUSEMOVE).is_none());
+        state.finish_promoted_pointer(7, false);
+        assert!(state.has_active_handoff());
+        state.finish_handoff(id);
+        assert!(!state.has_active_handoff());
+        assert!(state.compatibility.is_none());
+    }
+
+    #[test]
+    fn compatibility_late_mouse_down_cannot_revive_ended_touch() {
+        let mut state = WindowsTouchState::default();
+        let id = compatibility_contact(&mut state, 7);
+        state.finish(7);
+        state.compatibility_mouse_message(WM_LBUTTONDOWN);
+        assert_eq!(state.compatibility_mouse_ready(id), Some(false));
+        assert!(state.compatibility_mouse_message(WM_MOUSEMOVE).is_none());
+        state.compatibility_mouse_message(WM_LBUTTONUP);
+        assert!(state.compatibility.is_none());
+    }
+
+    #[test]
+    fn compatibility_second_contact_invalidates_mouse_ack() {
+        let mut state = WindowsTouchState::default();
+        let id = compatibility_contact(&mut state, 7);
+        state.compatibility_mouse_message(WM_LBUTTONDOWN);
+        state.mark_native_contact(8);
+        state.finish_native_contact(8);
+        assert_eq!(state.compatibility_mouse_ready(id), Some(false));
+        assert!(!state.compatibility_mouse_pending(id));
+    }
+
+    #[test]
+    fn compatibility_missing_pointer_up_recovers_on_new_primary_down() {
+        for next_pointer in [7, 8] {
+            let mut state = WindowsTouchState::default();
+            let id = compatibility_contact(&mut state, 7);
+            state.compatibility_mouse_message(WM_LBUTTONDOWN);
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            assert_eq!(state.prepare_handoff(id, cancelled), Some(7));
+            state.finish_handoff(id);
+            state.prepare_new_pointer_down(next_pointer, true);
+            assert!(!state.has_active_handoff());
+            assert!(state.active_contacts.is_empty());
+            let next_id = compatibility_contact(&mut state, next_pointer);
+            assert!(state.compatibility_mouse_pending(next_id));
+            assert!(!state.compatibility_mouse_pending(id));
+        }
+    }
+
+    #[test]
+    fn compatibility_new_secondary_down_does_not_evict_held_contact() {
+        let mut state = WindowsTouchState::default();
+        let id = compatibility_contact(&mut state, 7);
+        state.compatibility_mouse_message(WM_LBUTTONDOWN);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(state.prepare_handoff(id, cancelled), Some(7));
+        state.finish_handoff(id);
+        state.prepare_new_pointer_down(8, false);
+        assert!(state.has_active_handoff());
+        assert!(state.is_compatibility_pointer(7));
+    }
+
+    #[test]
+    fn compatibility_ole_capture_transfer_is_not_pointer_cancellation() {
+        for cancelled_info in [Some(false), None, Some(true)] {
+            let mut state = WindowsTouchState::default();
+            let id = compatibility_contact(&mut state, 7);
+            state.compatibility_mouse_message(WM_LBUTTONDOWN);
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            state.prepare_handoff(id, cancelled.clone()).unwrap();
+            state.promoted_capture_changed(7, cancelled_info);
+            assert_eq!(
+                cancelled.load(std::sync::atomic::Ordering::Acquire),
+                cancelled_info == Some(true)
+            );
+            state.finish_handoff(id);
+            state.prepare_new_pointer_down(8, true);
+            assert!(!state.has_active_handoff());
+        }
+    }
+
+    #[test]
+    fn noncompatibility_handoff_capture_loss_still_cancels() {
+        let mut state = WindowsTouchState::default();
+        let id = state
+            .begin(7, point(px(10.), px(20.)), None, true, None)
+            .unwrap()
+            .0
+            .id;
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.prepare_handoff(id, cancelled.clone()).unwrap();
+        state.promoted_capture_changed(7, Some(false));
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn compatibility_ole_cancel_keeps_suppression_until_pointer_up() {
+        let mut state = WindowsTouchState::default();
+        let id = compatibility_contact(&mut state, 7);
+        state.compatibility_mouse_message(WM_LBUTTONDOWN);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(state.prepare_handoff(id, cancelled), Some(7));
+        state.finish_handoff(id);
+        assert!(state.has_active_handoff());
+        assert!(state.is_compatibility_pointer(7));
+        state.finish_promoted_pointer(7, false);
+        assert!(!state.has_active_handoff());
+        let next = compatibility_contact(&mut state, 7);
+        assert_ne!(next, id);
+        assert_eq!(state.compatibility_mouse_ready(next), Some(false));
+    }
 
     #[test]
     fn windows_pointer_ids_do_not_reuse_touch_ids() {

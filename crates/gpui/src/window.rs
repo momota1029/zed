@@ -5735,6 +5735,13 @@ impl Window {
         true
     }
 
+    /// Distinguishes a pending native mouse DOWN from a rejected touch handoff.
+    pub fn is_touch_drag_handoff_pending(&self) -> bool {
+        self.touch_gestures
+            .claimed_touch_drag_id()
+            .is_some_and(|touch_id| self.platform_window.is_touch_drag_handoff_pending(touch_id))
+    }
+
     /// Finishes the platform side of an OLE touch drag handoff.
     pub fn finish_touch_drag_handoff(&mut self) {
         let Some(touch_id) = self.touch_drag_handoff.take() else {

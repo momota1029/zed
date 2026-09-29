@@ -875,6 +875,10 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Whether this exact contact is waiting for its native compatibility mouse DOWN.
+    fn is_touch_drag_handoff_pending(&self, _touch_id: crate::TouchId) -> bool {
+        false
+    }
     /// Promotes the exact claimed touch drag to Windows compatibility mouse input.
     /// Unsupported platforms leave the in-app touch drag route unchanged.
     fn promote_touch_drag_to_mouse(
