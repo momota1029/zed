@@ -31,7 +31,7 @@ use windows::{
             DataExchange::RegisterClipboardFormatW,
             Diagnostics::Debug::MessageBeep,
             LibraryLoader::*,
-            Memory::{GlobalAlloc, GlobalFree, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
+            Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
             Ole::*,
             SystemServices::*,
         },
@@ -1676,7 +1676,7 @@ fn set_performed_drop_effect_none(data_object: &IDataObject) -> Result<()> {
     let global = unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>())? };
     let pointer = unsafe { GlobalLock(global) };
     if pointer.is_null() {
-        unsafe { GlobalFree(global) };
+        let _ = unsafe { GlobalFree(Some(global)) };
         anyhow::bail!("GlobalLock failed for performed drop effect");
     }
     unsafe { *(pointer.cast::<u32>()) = DROPEFFECT_NONE.0 };
@@ -1695,7 +1695,7 @@ fn set_performed_drop_effect_none(data_object: &IDataObject) -> Result<()> {
     match unsafe { data_object.SetData(&format_etc, &medium, true) } {
         Ok(()) => Ok(()),
         Err(error) => {
-            unsafe { GlobalFree(global) };
+            let _ = unsafe { GlobalFree(Some(global)) };
             Err(error.into())
         }
     }
