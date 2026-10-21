@@ -24,7 +24,8 @@ use crate::{
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseInputSource, MouseMoveEvent,
     MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels,
     Point, Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
-    TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    TooltipId, TouchDragCandidateProbe, TouchDragEvent, TouchPhase, Visibility, Window,
+    WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -74,6 +75,9 @@ pub struct DragMoveEvent<T> {
 
     /// The bounds of this element.
     pub bounds: Bounds<Pixels>,
+    /// Provenance of the contact that started this drag. Callers that begin a
+    /// platform-native drag must reject [`MouseInputSource::Touch`].
+    pub source: MouseInputSource,
     drag: PhantomData<T>,
     dragged_item: Arc<dyn Any>,
 }
@@ -141,6 +145,17 @@ impl Interactivity {
                     (listener)(event, window, cx)
                 }
             }));
+    }
+
+    /// Bind to phases of a touch long-press gesture. Candidate contacts are
+    /// delivered only to the element identified at contact-down. Call
+    /// [`Window::prevent_default`] on `Started` to claim the gesture and
+    /// receive its later phases.
+    pub fn on_long_press(
+        &mut self,
+        listener: impl Fn(&LongPressEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.long_press_listeners.push(Rc::new(listener));
     }
 
     /// Bind the given callback to the mouse down event for any button, during the capture phase.
@@ -372,11 +387,16 @@ impl Interactivity {
                 if phase == DispatchPhase::Capture
                     && let Some(drag) = &cx.active_drag
                     && drag.value.as_ref().type_id() == TypeId::of::<T>()
+                    && (drag.source != crate::MouseInputSource::Touch
+                        || drag.touch_preview_position.is_some_and(|(touch_id, _)| {
+                            window.is_dispatching_touch_drag_move(touch_id)
+                        }))
                 {
                     (listener)(
                         &DragMoveEvent {
                             event: event.clone(),
                             bounds: hitbox.bounds,
+                            source: drag.source,
                             drag: PhantomData,
                             dragged_item: Arc::clone(&drag.value),
                         },
@@ -672,12 +692,39 @@ impl Interactivity {
         self.drag_listener = Some(DragListener {
             value: Arc::new(value),
             threshold: threshold.as_f32().max(0.0) as f64,
-            can_start: Box::new(can_start),
+            can_start: Rc::new(can_start),
             render: Box::new(move |value, offset, window, cx| {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
             }),
             external_payload: None,
+            touch_candidate: None,
         });
+    }
+
+    /// Enables touch contacts to start this typed drag after the touch movement slop is crossed.
+    /// The contact-down probe is non-mutating; ordinary touch taps and long presses remain intact.
+    pub fn on_touch_drag(&mut self) {
+        let Some(listener) = self.drag_listener.as_mut() else {
+            debug_assert!(false, "touch_drag must be called after on_drag");
+            return;
+        };
+        listener.touch_candidate = Some(Rc::new(|_, _, _| true));
+    }
+
+    /// Enables touch drag when a synchronous pointer-down callback accepts the drag candidate.
+    /// A reserved contact remains routed to GPUI even when the callback returns false, so its
+    /// ordinary tap and long-press behavior can continue without starting this drag.
+    /// The callback may snapshot application state but must not start the visual drag; GPUI starts
+    /// it only after movement crosses touch slop.
+    pub fn on_touch_drag_when(
+        &mut self,
+        candidate: impl Fn(&MouseDownEvent, &mut Window, &mut App) -> bool + 'static,
+    ) {
+        let Some(listener) = self.drag_listener.as_mut() else {
+            debug_assert!(false, "touch_drag_when must be called after on_drag");
+            return;
+        };
+        listener.touch_candidate = Some(Rc::new(candidate));
     }
 
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
@@ -917,6 +964,17 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().on_mouse_down(button, listener);
+        self
+    }
+
+    /// Bind to phases of a touch long-press gesture. Call
+    /// [`Window::prevent_default`] on `Started` to claim the gesture and
+    /// receive its later phases.
+    fn on_long_press(
+        mut self,
+        listener: impl Fn(&LongPressEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_long_press(listener);
         self
     }
 
@@ -1702,6 +1760,30 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Enables touch input for a typed drag registered with [`Self::on_drag`].
+    fn on_touch_drag(mut self) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_touch_drag();
+        self
+    }
+
+    /// Enables a typed touch drag when the synchronous pointer-down callback accepts the drag
+    /// candidate. A rejected candidate remains routed to GPUI for ordinary tap and long-press
+    /// behavior. The callback can snapshot the typed value before touch tap behavior changes
+    /// application selection; it must not start the visual drag before touch slop.
+    fn on_touch_drag_when(
+        mut self,
+        candidate: impl Fn(&MouseDownEvent, &mut Window, &mut App) -> bool + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_touch_drag_when(candidate);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -1787,6 +1869,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
 pub(crate) type MouseDownListener =
     Box<dyn Fn(&MouseDownEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type LongPressListener = dyn Fn(&LongPressEvent, &mut Window, &mut App) + 'static;
 pub(crate) type MouseUpListener =
     Box<dyn Fn(&MouseUpEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MousePressureListener =
@@ -1833,10 +1916,13 @@ impl HoverListenerMode {
 pub(crate) struct DragListener {
     value: Arc<dyn Any>,
     threshold: f64,
-    can_start: Box<dyn Fn(&MouseDownEvent) -> bool + 'static>,
+    can_start: Rc<dyn Fn(&MouseDownEvent) -> bool + 'static>,
     render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
     external_payload: Option<ExternalDragPayloadResolver>,
+    touch_candidate: Option<Rc<TouchDragCandidateFn>>,
 }
+
+type TouchDragCandidateFn = dyn Fn(&MouseDownEvent, &mut Window, &mut App) -> bool + 'static;
 
 type ExternalDragPayloadResolver =
     Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static>;
@@ -2237,6 +2323,7 @@ pub struct Interactivity {
     )>,
     pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
     pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
+    pub(crate) long_press_listeners: Vec<Rc<LongPressListener>>,
     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
     pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
@@ -2490,6 +2577,7 @@ impl Interactivity {
             || !self.mouse_up_listeners.is_empty()
             || !self.mouse_pressure_listeners.is_empty()
             || !self.mouse_down_listeners.is_empty()
+            || !self.long_press_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
             || !self.mouse_exit_listeners.is_empty()
             || !self.file_drop_exit_listeners.is_empty()
@@ -2661,6 +2749,7 @@ impl Interactivity {
                                             }
 
                                             self.paint_mouse_listeners(
+                                                global_id,
                                                 hitbox,
                                                 element_state.as_mut(),
                                                 window,
@@ -2831,6 +2920,7 @@ impl Interactivity {
 
     fn paint_mouse_listeners(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         hitbox: &Hitbox,
         element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
@@ -2865,6 +2955,24 @@ impl Interactivity {
             window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
+        }
+
+        for listener in self.long_press_listeners.drain(..) {
+            let global_id = global_id.cloned();
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                if let Some(target) = event.target.as_ref() {
+                    if Some(target) != global_id.as_ref() {
+                        return;
+                    }
+                } else if !hitbox.is_hovered(window) {
+                    return;
+                }
+                listener(event, window, cx);
+            });
         }
 
         for listener in self.mouse_up_listeners.drain(..) {
@@ -2968,7 +3076,7 @@ impl Interactivity {
 
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
-        let mut drag_listener = mem::take(&mut self.drag_listener);
+        let drag_listener = Rc::new(RefCell::new(mem::take(&mut self.drag_listener)));
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
@@ -3010,7 +3118,7 @@ impl Interactivity {
         if let Some(element_state) = element_state {
             if !click_listeners.is_empty()
                 || !aux_click_listeners.is_empty()
-                || drag_listener.is_some()
+                || drag_listener.borrow().is_some()
             {
                 let pending_mouse_down = element_state
                     .pending_mouse_down
@@ -3026,6 +3134,63 @@ impl Interactivity {
                     .clicked_state
                     .get_or_insert_with(Default::default)
                     .clone();
+                let probe_clicked_state = clicked_state.clone();
+
+                window.on_mouse_event({
+                    let drag_listener = drag_listener.clone();
+                    let hitbox = hitbox.clone();
+                    let global_id = global_id.cloned();
+                    let probe_clicked_state = probe_clicked_state.clone();
+                    move |probe: &TouchDragCandidateProbe, phase, window, _cx| {
+                        if phase != DispatchPhase::Bubble
+                            || !hitbox.is_hovered(window)
+                            || probe.is_reserved()
+                        {
+                            return;
+                        }
+                        let Some(global_id) = global_id.as_ref() else {
+                            return;
+                        };
+                        let listener_state = drag_listener.borrow();
+                        let Some(listener) = listener_state.as_ref() else {
+                            return;
+                        };
+                        let Some(candidate) = listener.touch_candidate.as_ref() else {
+                            return;
+                        };
+                        let down = MouseDownEvent {
+                            source: MouseInputSource::Touch,
+                            button: MouseButton::Left,
+                            position: probe.position(),
+                            ..Default::default()
+                        };
+                        if (listener.can_start)(&down) && probe.reserve(global_id.clone()) {
+                            if candidate(&down, window, _cx) {
+                                let cursor_offset = probe.position() - hitbox.origin;
+                                probe.accept_with_cursor_offset(cursor_offset);
+                                let drag_listener = drag_listener.clone();
+                                let clicked_state = probe_clicked_state.clone();
+                                let global_id = global_id.clone();
+                                let hitbox_origin = hitbox.origin;
+                                probe.retain_drag_start_handler(move |event, phase, window, cx| {
+                                    start_touch_drag(
+                                        event,
+                                        phase,
+                                        Some(&global_id),
+                                        &drag_listener,
+                                        hitbox_origin,
+                                        &clicked_state,
+                                        drag_cursor_style.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            } else {
+                                probe.accept(false);
+                            }
+                        }
+                    }
+                });
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
@@ -3044,6 +3209,8 @@ impl Interactivity {
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
+                    let drag_listener = drag_listener.clone();
+                    let clicked_state = clicked_state.clone();
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
@@ -3053,14 +3220,14 @@ impl Interactivity {
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
-                            && drag_listener.as_ref().is_some_and(|listener| {
+                            && drag_listener.borrow().as_ref().is_some_and(|listener| {
                                 exceeds_drag_threshold(
                                     mouse_down.position,
                                     event.position,
                                     listener.threshold,
                                 ) && (listener.can_start)(&mouse_down)
                             })
-                            && let Some(listener) = drag_listener.take()
+                            && let Some(listener) = drag_listener.borrow_mut().take()
                             && mouse_down.button == MouseButton::Left
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
@@ -3085,11 +3252,33 @@ impl Interactivity {
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
                                 external_payload_source,
+                                source: mouse_down.source,
+                                touch_preview_position: None,
                             });
                             pending_mouse_down.take();
                             window.refresh();
                             cx.stop_propagation();
                         }
+                    }
+                });
+
+                window.on_mouse_event({
+                    let drag_listener = drag_listener.clone();
+                    let hitbox = hitbox.clone();
+                    let clicked_state = clicked_state.clone();
+                    let global_id = global_id.cloned();
+                    move |event: &TouchDragEvent, phase, window, cx| {
+                        start_touch_drag(
+                            event,
+                            phase,
+                            global_id.as_ref(),
+                            &drag_listener,
+                            hitbox.origin,
+                            &clicked_state,
+                            drag_cursor_style,
+                            window,
+                            cx,
+                        );
                     }
                 });
 
@@ -3306,6 +3495,7 @@ impl Interactivity {
                     check_is_hovered_during_prepaint,
                     long_press_tooltip_active,
                     self.tooltip_show_delay,
+                    global_id.cloned(),
                     window,
                 );
             }
@@ -3557,6 +3747,7 @@ impl Interactivity {
 
         if let Some(hitbox) = hitbox {
             if let Some(drag) = cx.active_drag.take() {
+                let drag_position = drag.preview_position(window.mouse_position());
                 let mut can_drop = true;
                 if let Some(can_drop_predicate) = &self.can_drop_predicate {
                     can_drop = can_drop_predicate(drag.value.as_ref(), window, cx);
@@ -3567,14 +3758,15 @@ impl Interactivity {
                         if let Some(group_hitbox_id) =
                             GroupHitboxes::get(&group_drag_style.group, cx)
                             && *state_type == drag.value.as_ref().type_id()
-                            && group_hitbox_id.is_hovered(window)
+                            && group_hitbox_id.is_hovered_at_in_next_frame(drag_position, window)
                         {
                             style.refine(&group_drag_style.style);
                         }
                     }
 
                     for (state_type, build_drag_over_style) in &self.drag_over_styles {
-                        if *state_type == drag.value.as_ref().type_id() && hitbox.is_hovered(window)
+                        if *state_type == drag.value.as_ref().type_id()
+                            && hitbox.is_hovered_at_in_next_frame(drag_position, window)
                         {
                             style.refine(&build_drag_over_style(drag.value.as_ref(), window, cx));
                         }
@@ -3681,6 +3873,64 @@ impl Interactivity {
             node.add_action(*action);
         }
     }
+}
+
+/// Tests the contact-down target identity captured by the touch candidate probe.
+/// Direct Manipulation may scroll the row away from the original contact point before slop is
+/// crossed, so activation must not depend on the current hitbox hover state.
+fn touch_drag_start_targets_element(
+    event: &TouchDragEvent,
+    phase: DispatchPhase,
+    global_id: Option<&GlobalElementId>,
+) -> bool {
+    phase == DispatchPhase::Bubble
+        && event.phase == TouchPhase::Started
+        && matches!((global_id, event.target.as_ref()), (Some(expected), Some(actual)) if expected == actual)
+}
+
+fn start_touch_drag(
+    event: &TouchDragEvent,
+    phase: DispatchPhase,
+    global_id: Option<&GlobalElementId>,
+    drag_listener: &Rc<RefCell<Option<DragListener>>>,
+    hitbox_origin: Point<Pixels>,
+    clicked_state: &Rc<RefCell<ElementClickedState>>,
+    drag_cursor_style: Option<crate::CursorStyle>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !touch_drag_start_targets_element(event, phase, global_id) || cx.has_active_drag() {
+        return;
+    }
+    let Some(listener) = drag_listener.borrow_mut().take() else {
+        return;
+    };
+    if listener.touch_candidate.is_none() {
+        *drag_listener.borrow_mut() = Some(listener);
+        return;
+    }
+    *clicked_state.borrow_mut() = ElementClickedState::default();
+    let cursor_offset = event
+        .cursor_offset
+        .unwrap_or_else(|| event.position - hitbox_origin);
+    let drag = (listener.render)(listener.value.as_ref(), cursor_offset, window, cx);
+    let external_payload_source = listener.external_payload.map(|external_payload| {
+        let value = listener.value.clone();
+        Box::new(move |window: &mut Window, cx: &mut App| {
+            external_payload(value.as_ref(), window, cx)
+        }) as ExternalDragPayloadSource
+    });
+    cx.active_drag = Some(AnyDrag {
+        view: drag,
+        value: listener.value,
+        cursor_offset,
+        cursor_style: drag_cursor_style,
+        external_payload_source,
+        source: MouseInputSource::Touch,
+        touch_preview_position: None,
+    });
+    window.refresh();
+    cx.stop_propagation();
 }
 
 /// The per-frame state of an interactive element. Used for tracking stateful interactions like clicks
@@ -3797,6 +4047,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
     long_press_tooltip_active: Rc<Cell<bool>>,
     show_delay: Option<Duration>,
+    global_id: Option<GlobalElementId>,
     window: &mut Window,
 ) {
     let current_view = window.current_view();
@@ -3836,8 +4087,16 @@ pub(crate) fn register_tooltip_mouse_handlers(
         let active_tooltip = active_tooltip.clone();
         let build_tooltip = build_tooltip.clone();
         let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+        let global_id = global_id.clone();
         move |event: &LongPressEvent, phase, window, cx| {
             if !phase.bubble() {
+                return;
+            }
+            if event
+                .target
+                .as_ref()
+                .is_some_and(|target| Some(target) != global_id.as_ref())
+            {
                 return;
             }
 
@@ -4523,9 +4782,284 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, Keystroke,
-        MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas, util::FluentBuilder as _,
+        MouseMoveEvent, TestAppContext, TouchDragCandidateProbe, TouchDragEvent, TouchEvent,
+        TouchId, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    struct TouchDragMovedRow {
+        moved: bool,
+        unmounted: bool,
+        cursor_offset: Rc<Cell<Option<Point<Pixels>>>>,
+    }
+
+    impl Render for TouchDragMovedRow {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let cursor_offset = self.cursor_offset.clone();
+            let top = if self.moved { px(300.) } else { px(20.) };
+            let row = div()
+                .id("touch-drag-row")
+                .absolute()
+                .left(px(10.))
+                .top(top)
+                .size(px(80.))
+                .on_drag((), move |_, offset, _, cx| {
+                    cursor_offset.set(Some(offset));
+                    cx.new(|_| crate::Empty)
+                })
+                .on_touch_drag_when(|_, _, _| true);
+            let root = div().size_full();
+            if self.unmounted {
+                root
+            } else {
+                root.child(row)
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn touch_drag_after_repaint_uses_the_captured_target_and_down_offset(cx: &mut TestAppContext) {
+        let cursor_offset = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let cursor_offset = cursor_offset.clone();
+            move |_, _| TouchDragMovedRow {
+                moved: false,
+                unmounted: false,
+                cursor_offset,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let contact_position = point(px(18.), px(27.));
+        let probe = TouchDragCandidateProbe::new(contact_position);
+        let (target, cursor_offset_at_down) = cx
+            .update_window(any_window, |_, window, cx| {
+                let result = window.dispatch_event(probe.clone().to_platform_input(), cx);
+                assert!(result.touch_drag_candidate);
+                (
+                    result.touch_drag_target.expect("probe admitted the row"),
+                    result
+                        .touch_drag_cursor_offset
+                        .expect("accepted probe records its offset"),
+                )
+            })
+            .unwrap();
+
+        let touch_id = TouchId(42);
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: touch_id,
+                    phase: TouchPhase::Started,
+                    position: contact_position,
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: true,
+                    drag_target: Some(target.clone()),
+                    drag_cursor_offset: Some(cursor_offset_at_down),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.moved = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: touch_id,
+                    phase: TouchPhase::Moved,
+                    position: point(px(20.), px(57.)),
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: false,
+                    drag_target: None,
+                    drag_cursor_offset: None,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+
+        assert_eq!(cursor_offset.get(), Some(cursor_offset_at_down));
+    }
+
+    #[gpui::test]
+    fn touch_drag_probe_counts_as_touch_after_keyboard_scroll_input(cx: &mut TestAppContext) {
+        let cursor_offset = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let cursor_offset = cursor_offset.clone();
+            move |_, _| TouchDragMovedRow {
+                moved: false,
+                unmounted: false,
+                cursor_offset,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                KeyDownEvent {
+                    keystroke: Keystroke::parse("a").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: point(px(18.), px(27.)),
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(-12.))),
+                    modifiers: Default::default(),
+                    touch_phase: TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(window.last_input_was_keyboard());
+
+            let probe = TouchDragCandidateProbe::new(point(px(18.), px(27.)));
+            let result = window.dispatch_event(probe.to_platform_input(), cx);
+            assert!(result.touch_drag_candidate);
+            assert!(!window.last_input_was_keyboard());
+            assert!(result.touch_drag_target.is_some());
+            assert_eq!(result.touch_drag_cursor_offset, Some(point(px(8.), px(7.))));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn touch_drag_after_source_unmount_uses_retained_activation(cx: &mut TestAppContext) {
+        let cursor_offset = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let cursor_offset = cursor_offset.clone();
+            move |_, _| TouchDragMovedRow {
+                moved: false,
+                unmounted: false,
+                cursor_offset,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let contact_position = point(px(18.), px(27.));
+        let probe = TouchDragCandidateProbe::new(contact_position);
+        let (target, cursor_offset_at_down) = cx
+            .update_window(any_window, |_, window, cx| {
+                let result = window.dispatch_event(probe.clone().to_platform_input(), cx);
+                assert!(result.touch_drag_candidate);
+                (
+                    result.touch_drag_target.expect("probe admitted the row"),
+                    result
+                        .touch_drag_cursor_offset
+                        .expect("accepted probe records its offset"),
+                )
+            })
+            .unwrap();
+
+        // Scrolling may virtualize the source row before the finger crosses touch slop.
+        window
+            .update(cx, |view, _, cx| {
+                view.unmounted = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let touch_id = TouchId(43);
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: touch_id,
+                    phase: TouchPhase::Started,
+                    position: contact_position,
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: true,
+                    drag_target: Some(target.clone()),
+                    drag_cursor_offset: Some(cursor_offset_at_down),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                TouchEvent {
+                    timestamp: None,
+                    id: touch_id,
+                    phase: TouchPhase::Moved,
+                    position: point(px(20.), px(57.)),
+                    predicted_position: None,
+                    force: None,
+                    drag_candidate: false,
+                    drag_target: Some(target.clone()),
+                    drag_cursor_offset: Some(cursor_offset_at_down),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+
+        assert_eq!(cursor_offset.get(), Some(cursor_offset_at_down));
+    }
+
+    #[test]
+    fn touch_drag_start_keeps_the_contact_down_element_after_it_scrolls_away() {
+        let down_target = GlobalElementId(vec![crate::ElementId::Integer(1)].into());
+        let other_target = GlobalElementId(vec![crate::ElementId::Integer(2)].into());
+        let event = TouchDragEvent {
+            id: TouchId(44),
+            phase: TouchPhase::Started,
+            start_position: point(px(10.), px(10.)),
+            // The contact has moved far from its down point, as when scrolling shifts the row.
+            position: point(px(10.), px(400.)),
+            target: Some(down_target.clone()),
+            cursor_offset: None,
+        };
+
+        assert!(touch_drag_start_targets_element(
+            &event,
+            DispatchPhase::Bubble,
+            Some(&down_target),
+        ));
+        assert!(!touch_drag_start_targets_element(
+            &event,
+            DispatchPhase::Bubble,
+            Some(&other_target),
+        ));
+        assert!(!touch_drag_start_targets_element(
+            &event,
+            DispatchPhase::Capture,
+            Some(&down_target),
+        ));
+        let mut unclaimed_event = event.clone();
+        unclaimed_event.target = None;
+        assert!(!touch_drag_start_targets_element(
+            &unclaimed_event,
+            DispatchPhase::Bubble,
+            None,
+        ));
+    }
 
     #[test]
     fn custom_drag_threshold_uses_distance_from_pointer_down() {
@@ -5041,6 +5575,9 @@ mod tests {
                         position: touch_position,
                         predicted_position: None,
                         force: None,
+                        drag_candidate: false,
+                        drag_target: None,
+                        drag_cursor_offset: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5068,6 +5605,9 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        drag_candidate: false,
+                        drag_target: None,
+                        drag_cursor_offset: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5090,6 +5630,9 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        drag_candidate: false,
+                        drag_target: None,
+                        drag_cursor_offset: None,
                     }
                     .to_platform_input(),
                     cx,

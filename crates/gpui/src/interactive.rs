@@ -308,7 +308,143 @@ pub struct TouchEvent {
     pub predicted_position: Option<Point<Pixels>>,
     /// Normalized touch force in `0.0..=1.0`, if the hardware reports it.
     pub force: Option<f32>,
+    /// True when the contact may become a typed drag after it crosses touch slop.
+    /// A reserved contact can still be routed to GPUI with this set to false so
+    /// ordinary tap and long-press input stays on the same element.
+    pub drag_candidate: bool,
+    /// Stable identity of the element that claimed this contact for GPUI at pointer-down.
+    /// A claimed contact may still be an ordinary tap/pan rather than a drag candidate.
+    pub drag_target: Option<crate::GlobalElementId>,
+    /// Finger offset inside an accepted touch-drag target at contact down.
+    pub drag_cursor_offset: Option<Point<Pixels>>,
 }
+
+/// The retained source handler for an accepted touch drag candidate.
+pub(crate) type TouchDragStartHandler = Box<
+    dyn FnMut(&TouchDragEvent, crate::DispatchPhase, &mut crate::Window, &mut crate::App) + 'static,
+>;
+
+/// A non-mutating hit-test request used by a platform to choose whether a
+/// touch contact belongs to GPUI or to a native gesture handler.
+#[derive(Clone)]
+pub struct TouchDragCandidateProbe {
+    position: Point<Pixels>,
+    target: std::rc::Rc<std::cell::RefCell<Option<crate::GlobalElementId>>>,
+    accepted: std::rc::Rc<std::cell::Cell<bool>>,
+    drag_cursor_offset: std::rc::Rc<std::cell::Cell<Option<Point<Pixels>>>>,
+    drag_start_handler: std::rc::Rc<std::cell::RefCell<Option<TouchDragStartHandler>>>,
+}
+
+impl std::fmt::Debug for TouchDragCandidateProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TouchDragCandidateProbe")
+            .field("position", &self.position)
+            .field("target", &self.target.borrow())
+            .field("accepted", &self.accepted.get())
+            .field("drag_cursor_offset", &self.drag_cursor_offset.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TouchDragCandidateProbe {
+    /// Creates a probe for a touch contact position.
+    pub fn new(position: Point<Pixels>) -> Self {
+        Self {
+            position,
+            target: Default::default(),
+            accepted: Default::default(),
+            drag_cursor_offset: Default::default(),
+            drag_start_handler: Default::default(),
+        }
+    }
+
+    /// Returns the queried position.
+    pub fn position(&self) -> Point<Pixels> {
+        self.position
+    }
+
+    /// Marks this position as an opted-in touch drag target.
+    #[doc(hidden)]
+    pub fn reserve(&self, target: crate::GlobalElementId) -> bool {
+        let mut current = self.target.borrow_mut();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(target);
+        true
+    }
+
+    /// Marks the reserved target as a drag candidate or ordinary GPUI touch target.
+    #[doc(hidden)]
+    pub fn accept(&self, accepted: bool) {
+        self.accepted.set(accepted);
+        if !accepted {
+            self.drag_cursor_offset.set(None);
+            self.drag_start_handler.borrow_mut().take();
+        }
+    }
+
+    /// Stores the contact-down offset for an accepted drag candidate.
+    #[doc(hidden)]
+    pub fn accept_with_cursor_offset(&self, cursor_offset: Point<Pixels>) {
+        self.drag_cursor_offset.set(Some(cursor_offset));
+        self.accepted.set(true);
+    }
+
+    /// Retains the accepted source callback until touch drag activation, even if its element is
+    /// virtualized out of the current frame before touch slop is crossed.
+    #[doc(hidden)]
+    pub(crate) fn retain_drag_start_handler(
+        &self,
+        handler: impl FnMut(&TouchDragEvent, crate::DispatchPhase, &mut crate::Window, &mut crate::App)
+        + 'static,
+    ) {
+        if self.is_candidate() {
+            *self.drag_start_handler.borrow_mut() = Some(Box::new(handler));
+        }
+    }
+
+    pub(crate) fn take_drag_start_handler(&self) -> Option<TouchDragStartHandler> {
+        if self.is_candidate() {
+            self.drag_start_handler.borrow_mut().take()
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether the reserved target may start a typed drag.
+    pub fn is_candidate(&self) -> bool {
+        self.accepted.get()
+    }
+
+    /// Returns whether an element has already been selected for this probe.
+    #[doc(hidden)]
+    pub fn is_reserved(&self) -> bool {
+        self.target.borrow().is_some()
+    }
+
+    /// Returns the one stable element identity reserved by the hit-tested probe.
+    pub fn target(&self) -> Option<crate::GlobalElementId> {
+        self.target.borrow().clone()
+    }
+
+    /// Returns the contact-down offset only when the probe was accepted as a drag candidate.
+    pub fn drag_cursor_offset(&self) -> Option<Point<Pixels>> {
+        if self.is_candidate() {
+            self.drag_cursor_offset.get()
+        } else {
+            None
+        }
+    }
+}
+
+impl Sealed for TouchDragCandidateProbe {}
+impl InputEvent for TouchDragCandidateProbe {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::TouchDragCandidateProbe(self)
+    }
+}
+impl MouseEvent for TouchDragCandidateProbe {}
 
 impl Sealed for TouchEvent {}
 impl InputEvent for TouchEvent {
@@ -988,6 +1124,8 @@ pub enum PlatformInput {
     FileDrop(FileDropEvent),
     /// A raw touch event on a touch screen.
     Touch(TouchEvent),
+    /// Probe whether the touch position is an opted-in typed drag target.
+    TouchDragCandidateProbe(TouchDragCandidateProbe),
 }
 
 impl PlatformInput {
@@ -1007,6 +1145,7 @@ impl PlatformInput {
             PlatformInput::TouchDrag(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
             PlatformInput::Touch(_) => None,
+            PlatformInput::TouchDragCandidateProbe(_) => None,
         }
     }
 
@@ -1026,6 +1165,7 @@ impl PlatformInput {
             PlatformInput::TouchDrag(_) => None,
             PlatformInput::FileDrop(_) => None,
             PlatformInput::Touch(_) => None,
+            PlatformInput::TouchDragCandidateProbe(_) => None,
         }
     }
 
@@ -1047,6 +1187,7 @@ impl PlatformInput {
             PlatformInput::TouchDrag(_) => "touch_drag",
             PlatformInput::FileDrop(_) => "file_drop",
             PlatformInput::Touch(_) => "touch",
+            PlatformInput::TouchDragCandidateProbe(_) => "touch_drag_candidate_probe",
         }
     }
 
@@ -1066,6 +1207,20 @@ mod test {
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
         KeyBinding, Keystroke, Modifiers, ParentElement, Render, TestAppContext, Window, div,
     };
+
+    #[test]
+    fn touch_drag_probe_exposes_offset_only_for_an_accepted_candidate() {
+        let position = crate::point(crate::px(18.), crate::px(27.));
+        let offset = crate::point(crate::px(8.), crate::px(7.));
+        let target = crate::GlobalElementId::default();
+        let probe = crate::TouchDragCandidateProbe::new(position);
+        assert!(probe.reserve(target));
+        probe.accept_with_cursor_offset(offset);
+        assert_eq!(probe.drag_cursor_offset(), Some(offset));
+
+        probe.accept(false);
+        assert_eq!(probe.drag_cursor_offset(), None);
+    }
 
     struct TestView {
         saw_key_down: bool,
