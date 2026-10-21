@@ -31,7 +31,7 @@ use windows::{
             DataExchange::RegisterClipboardFormatW,
             Diagnostics::Debug::MessageBeep,
             LibraryLoader::*,
-            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+            Memory::{GlobalAlloc, GlobalFree, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
             Ole::*,
             SystemServices::*,
         },
@@ -1305,6 +1305,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                         local_drag_session: self.local_drag_session.get(),
                         paths: Some(paths),
                         response: response.clone(),
+                        ..FileDropContext::default()
                     },
                 );
                 *pdweffect = resolve_drop_effect(
@@ -1432,6 +1433,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 local_drag_session: self.local_drag_session.get(),
                 paths: None,
                 response: response.clone(),
+                ..FileDropContext::default()
             },
         );
         let helper_effect = unsafe {
@@ -1517,7 +1519,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     fn Drop(
         &self,
         pdataobj: windows::core::Ref<IDataObject>,
-        _grfkeystate: MODIFIERKEYS_FLAGS,
+        grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
@@ -1556,11 +1558,58 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 .log_err();
         }
         let scale_factor = self.window.state.scale_factor.get();
+        let shift_pressed = grfkeystate.0 & MK_SHIFT.0 != 0;
+        let transfer_lease = if shift_pressed
+            && entered_session.is_none()
+            && allowed_effects.0 & DROPEFFECT_MOVE.0 != 0
+            // We must return Copy or None after target-side Move so the
+            // source cannot perform cleanup. Require Copy to be negotiated
+            // before app code can start the async transfer or admit mutation.
+            && allowed_effects.0 & DROPEFFECT_COPY.0 != 0
+        {
+            idata_obj
+                .cast::<IDataObjectAsyncCapability>()
+                .ok()
+                .map(|async_capability| {
+                    let data_object = idata_obj.clone();
+                    gpui::FileDropTransferLease::new(move || {
+                        let async_mode = unsafe { async_capability.GetAsyncMode() }
+                            .ok()
+                            .is_some_and(|enabled| enabled.as_bool());
+                        if !async_mode
+                            || unsafe { async_capability.StartOperation(None::<&IBindCtx>) }.is_err()
+                        {
+                            return None;
+                        }
+                        Some(gpui::FileDropTransferCompletion::new(move |outcome| {
+                            let (mut result, status) = match outcome {
+                                gpui::FileDropTransferOutcome::Succeeded => (S_OK, "succeeded"),
+                                gpui::FileDropTransferOutcome::Cancelled => (E_ABORT, "cancelled"),
+                                gpui::FileDropTransferOutcome::Failed => (E_FAIL, "failed"),
+                            };
+                            let feedback = set_performed_drop_effect_none(&data_object);
+                            if feedback.is_err() {
+                                result = E_FAIL;
+                            }
+                            let ended = unsafe {
+                                async_capability.EndOperation(result, None::<&IBindCtx>, DROPEFFECT_NONE.0)
+                            };
+                            if feedback.is_err() || ended.is_err() {
+                                eprintln!("[file-drop] optimized move feedback failed after {status}: feedback={feedback:?} end={ended:?}");
+                            }
+                        }))
+                    })
+                })
+        } else {
+            None
+        };
         let effect = run_file_drop_dispatch(
             &self.callback_dispatch,
             supports_file_drop,
             entered_session,
             allowed_effects,
+            shift_pressed,
+            transfer_lease,
             || {
                 let paths = read_file_drop_paths(idata_obj)?;
                 let session = read_local_drag_session(idata_obj);
@@ -1621,6 +1670,37 @@ fn resolve_drop_effect(
     }
 }
 
+fn set_performed_drop_effect_none(data_object: &IDataObject) -> Result<()> {
+    let format = unsafe { RegisterClipboardFormatW(CFSTR_PERFORMEDDROPEFFECT) };
+    anyhow::ensure!(format != 0, "RegisterClipboardFormatW failed for performed drop effect");
+    let global = unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>())? };
+    let pointer = unsafe { GlobalLock(global) };
+    if pointer.is_null() {
+        unsafe { GlobalFree(global) };
+        anyhow::bail!("GlobalLock failed for performed drop effect");
+    }
+    unsafe { *(pointer.cast::<u32>()) = DROPEFFECT_NONE.0 };
+    unsafe { GlobalUnlock(global).ok() };
+
+    let format_etc = FORMATETC {
+        cfFormat: format as u16,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    };
+    let mut medium = STGMEDIUM::default();
+    medium.tymed = TYMED_HGLOBAL.0 as u32;
+    medium.u.hGlobal = global;
+    match unsafe { data_object.SetData(&format_etc, &medium, true) } {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            unsafe { GlobalFree(global) };
+            Err(error.into())
+        }
+    }
+}
+
 fn can_dispatch_file_drop_submit(
     valid_cf_hdrop: bool,
     session_matches: bool,
@@ -1635,6 +1715,8 @@ fn run_file_drop_dispatch(
     supports_file_drop: bool,
     entered_session: Option<LocalDragSessionToken>,
     allowed_effects: DROPEFFECT,
+    shift_pressed: bool,
+    transfer_lease: Option<gpui::FileDropTransferLease>,
     read_payload: impl FnOnce() -> Option<(ExternalPaths, Option<LocalDragSessionToken>)>,
     submit: impl FnOnce(FileDropContext) -> bool,
     helper_drop: impl FnOnce(DROPEFFECT),
@@ -1655,10 +1737,13 @@ fn run_file_drop_dispatch(
         reentered_before_submit,
     );
     let response = FileDropResponse::default();
+    let optimized_move_candidate = transfer_lease.is_some();
     let callback_present = if let (Some(paths), true) = (paths, can_submit) {
         submit(FileDropContext {
             local_drag_session: drop_session,
             paths: Some(paths),
+            shift_pressed,
+            transfer_lease,
             response: response.clone(),
         })
     } else {
@@ -1668,12 +1753,21 @@ fn run_file_drop_dispatch(
     let reentered = reentered_before_submit || reentered_during_submit;
     let mut terminal = terminal_before_submit || terminal_during_submit;
     let mut should_exit = supports_file_drop && (!can_submit || !callback_present || reentered);
-    let effect = resolve_drop_effect(
+    let mut effect = resolve_drop_effect(
         response.effect(),
         callback_present,
         valid_cf_hdrop && session_matches && supports_file_drop,
         allowed_effects,
     );
+    // Target-side optimized Move must never return OLE MOVE: that would let
+    // the source independently delete files after our executor already did.
+    if optimized_move_candidate && effect == DROPEFFECT_MOVE {
+        effect = if allowed_effects.0 & DROPEFFECT_COPY.0 != 0 {
+            DROPEFFECT_COPY
+        } else {
+            DROPEFFECT_NONE
+        };
+    }
 
     // Submit が同期的に操作を受理した後の再入では、返却 effect と受理結果を一致させる。
     helper_drop(effect);
@@ -2350,6 +2444,8 @@ mod tests {
             true,
             Some(token),
             DROPEFFECT_COPY,
+            false,
+            None,
             || {
                 assert!(dispatch.enter(true).is_none());
                 Some((
@@ -2393,6 +2489,8 @@ mod tests {
                 true,
                 Some(token),
                 DROPEFFECT_MOVE,
+                false,
+                None,
                 || {
                     Some((
                         ExternalPaths([PathBuf::from("replacement.txt")].into_iter().collect()),

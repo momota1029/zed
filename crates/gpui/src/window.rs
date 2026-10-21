@@ -8099,6 +8099,7 @@ mod tests {
                     local_drag_session: Some(LocalDragSessionToken::new(0x1234)),
                     paths,
                     response: FileDropResponse::default(),
+                    ..FileDropContext::default()
                 };
                 let event = if position.x == px(30.) {
                     FileDropEvent::Submit { position }

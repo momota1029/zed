@@ -9,6 +9,7 @@ use std::{
     fmt::Debug,
     ops::Deref,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -74,6 +75,69 @@ impl FileDropResponse {
     }
 }
 
+/// Result reported to a native source after a target-side asynchronous move.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDropTransferOutcome {
+    Succeeded,
+    Cancelled,
+    Failed,
+}
+
+/// UI-thread-only completion for one native asynchronous transfer.
+pub struct FileDropTransferCompletion(Option<Box<dyn FnOnce(FileDropTransferOutcome)>>);
+
+impl FileDropTransferCompletion {
+    /// Creates a completion callback owned by the native drop adapter.
+    pub fn new(callback: impl FnOnce(FileDropTransferOutcome) + 'static) -> Self {
+        Self(Some(Box::new(callback)))
+    }
+
+    /// Settles the native transfer exactly once.
+    pub fn complete(mut self, outcome: FileDropTransferOutcome) {
+        if let Some(callback) = self.0.take() {
+            callback(outcome);
+        }
+    }
+}
+
+impl Drop for FileDropTransferCompletion {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            callback(FileDropTransferOutcome::Cancelled);
+        }
+    }
+}
+
+impl Debug for FileDropTransferCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileDropTransferCompletion").finish_non_exhaustive()
+    }
+}
+
+/// Native capability prepared at Drop and started only for an eligible target move.
+#[derive(Clone)]
+pub struct FileDropTransferLease(Rc<RefCell<Option<Box<dyn FnOnce() -> Option<FileDropTransferCompletion>>>>>);
+
+impl FileDropTransferLease {
+    /// Creates an opaque UI-thread callback bridge. The callback must perform
+    /// native async-transfer negotiation and StartOperation synchronously.
+    pub fn new(start: impl FnOnce() -> Option<FileDropTransferCompletion> + 'static) -> Self {
+        Self(Rc::new(RefCell::new(Some(Box::new(start)))))
+    }
+
+    /// Starts this transfer once and returns its completion handle.
+    pub fn start(&self) -> Option<FileDropTransferCompletion> {
+        let start = self.0.borrow_mut().take()?;
+        start()
+    }
+}
+
+impl Debug for FileDropTransferLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileDropTransferLease").finish_non_exhaustive()
+    }
+}
+
 /// Drag provenance and response handle available during file-drop dispatch.
 #[derive(Clone, Debug, Default)]
 pub struct FileDropContext {
@@ -81,6 +145,10 @@ pub struct FileDropContext {
     pub local_drag_session: Option<LocalDragSessionToken>,
     /// Current CF_HDROP paths, refreshed from the data object for each event that can submit.
     pub paths: Option<ExternalPaths>,
+    /// Shift state captured from the native Drop callback, never synthesized by GPUI.
+    pub shift_pressed: bool,
+    /// Present only for a foreign source that offered MOVE and supports async transfer.
+    pub transfer_lease: Option<FileDropTransferLease>,
     /// Handle for synchronously selecting the effect returned by the platform.
     pub response: FileDropResponse,
 }
