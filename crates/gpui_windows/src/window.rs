@@ -31,7 +31,7 @@ use windows::{
             DataExchange::RegisterClipboardFormatW,
             Diagnostics::Debug::MessageBeep,
             LibraryLoader::*,
-            Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
             Ole::*,
             SystemServices::*,
         },
@@ -1643,8 +1643,16 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 .log_err();
         }
         let scale_factor = self.window.state.scale_factor.get();
-        let shift_pressed = grfkeystate.0 & MK_SHIFT.0 != 0;
+        let modifiers = gpui::Modifiers {
+            control: grfkeystate.0 & MK_CONTROL.0 != 0,
+            alt: grfkeystate.0 & MK_ALT != 0,
+            shift: grfkeystate.0 & MK_SHIFT.0 != 0,
+            ..Default::default()
+        };
+        let shift_pressed = modifiers.shift;
         let transfer_lease = if shift_pressed
+            && !modifiers.alt
+            && !(modifiers.control && modifiers.shift)
             && entered_session.is_none()
             && allowed_effects.0 & DROPEFFECT_MOVE.0 != 0
             // We must return Copy or None after target-side Move so the
@@ -1693,7 +1701,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             supports_file_drop,
             entered_session,
             allowed_effects,
-            shift_pressed,
+            modifiers,
             transfer_lease,
             || {
                 let paths = read_file_drop_paths(idata_obj)?;
@@ -1746,6 +1754,7 @@ fn resolve_drop_effect(
         Some(FileDropEffect::None) => DROPEFFECT_NONE,
         Some(FileDropEffect::Copy) => DROPEFFECT_COPY,
         Some(FileDropEffect::Move) => DROPEFFECT_MOVE,
+        Some(FileDropEffect::Link) => DROPEFFECT_LINK,
         None => DROPEFFECT_COPY,
     };
     if requested == DROPEFFECT_NONE || requested.0 & allowed_effects.0 == 0 {
@@ -1757,7 +1766,10 @@ fn resolve_drop_effect(
 
 fn set_performed_drop_effect_none(data_object: &IDataObject) -> Result<()> {
     let format = unsafe { RegisterClipboardFormatW(CFSTR_PERFORMEDDROPEFFECT) };
-    anyhow::ensure!(format != 0, "RegisterClipboardFormatW failed for performed drop effect");
+    anyhow::ensure!(
+        format != 0,
+        "RegisterClipboardFormatW failed for performed drop effect"
+    );
     let global = unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>())? };
     let pointer = unsafe { GlobalLock(global) };
     if pointer.is_null() {
@@ -1800,7 +1812,7 @@ fn run_file_drop_dispatch(
     supports_file_drop: bool,
     entered_session: Option<LocalDragSessionToken>,
     allowed_effects: DROPEFFECT,
-    shift_pressed: bool,
+    modifiers: gpui::Modifiers,
     transfer_lease: Option<gpui::FileDropTransferLease>,
     read_payload: impl FnOnce() -> Option<(ExternalPaths, Option<LocalDragSessionToken>)>,
     submit: impl FnOnce(FileDropContext) -> bool,
@@ -1827,7 +1839,9 @@ fn run_file_drop_dispatch(
         submit(FileDropContext {
             local_drag_session: drop_session,
             paths: Some(paths),
-            shift_pressed,
+            shift_pressed: modifiers.shift,
+            modifiers,
+            link_allowed: allowed_effects.0 & DROPEFFECT_LINK.0 != 0,
             transfer_lease,
             response: response.clone(),
         })
@@ -2406,7 +2420,9 @@ mod tests {
         DevicePixels, ExternalPaths, FileDropEvent, LocalDragSessionToken, MouseButton, point,
     };
     use std::{cell::RefCell, path::PathBuf, time::Duration};
-    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE};
+    use windows::Win32::System::Ole::{
+        DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
+    };
 
     #[test]
     fn file_drop_effect_mapping_requires_callback_and_preserves_legacy_copy() {
@@ -2436,6 +2452,24 @@ mod tests {
                 DROPEFFECT_MOVE
             ),
             DROPEFFECT_MOVE
+        );
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Link),
+                true,
+                true,
+                DROPEFFECT_LINK,
+            ),
+            DROPEFFECT_LINK
+        );
+        assert_eq!(
+            resolve_drop_effect(
+                Some(gpui::FileDropEffect::Link),
+                true,
+                true,
+                DROPEFFECT_COPY,
+            ),
+            DROPEFFECT_NONE
         );
         assert_eq!(
             resolve_drop_effect(None, true, true, DROPEFFECT_COPY),
@@ -2539,7 +2573,7 @@ mod tests {
             true,
             Some(token),
             DROPEFFECT_COPY,
-            false,
+            gpui::Modifiers::default(),
             None,
             || {
                 assert!(dispatch.enter(true).is_none());
@@ -2584,7 +2618,7 @@ mod tests {
                 true,
                 Some(token),
                 DROPEFFECT_MOVE,
-                false,
+                gpui::Modifiers::default(),
                 None,
                 || {
                     Some((

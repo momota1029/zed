@@ -41,6 +41,8 @@ pub enum FileDropEffect {
     Copy,
     /// The target accepts a move operation.
     Move,
+    /// The target creates links and must be advertised as DROPEFFECT_LINK.
+    Link,
 }
 
 /// A synchronous response slot shared with the platform drop callback.
@@ -60,6 +62,7 @@ impl FileDropResponse {
             FileDropEffect::None => 1,
             FileDropEffect::Copy => 2,
             FileDropEffect::Move => 3,
+            FileDropEffect::Link => 4,
         };
         self.0.store(value, Ordering::SeqCst);
     }
@@ -70,6 +73,7 @@ impl FileDropResponse {
             1 => Some(FileDropEffect::None),
             2 => Some(FileDropEffect::Copy),
             3 => Some(FileDropEffect::Move),
+            4 => Some(FileDropEffect::Link),
             _ => None,
         }
     }
@@ -110,13 +114,16 @@ impl Drop for FileDropTransferCompletion {
 
 impl Debug for FileDropTransferCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileDropTransferCompletion").finish_non_exhaustive()
+        f.debug_struct("FileDropTransferCompletion")
+            .finish_non_exhaustive()
     }
 }
 
 /// Native capability prepared at Drop and started only for an eligible target move.
 #[derive(Clone)]
-pub struct FileDropTransferLease(Rc<RefCell<Option<Box<dyn FnOnce() -> Option<FileDropTransferCompletion>>>>>);
+pub struct FileDropTransferLease(
+    Rc<RefCell<Option<Box<dyn FnOnce() -> Option<FileDropTransferCompletion>>>>>,
+);
 
 impl FileDropTransferLease {
     /// Creates an opaque UI-thread callback bridge. The callback must perform
@@ -134,7 +141,8 @@ impl FileDropTransferLease {
 
 impl Debug for FileDropTransferLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileDropTransferLease").finish_non_exhaustive()
+        f.debug_struct("FileDropTransferLease")
+            .finish_non_exhaustive()
     }
 }
 
@@ -147,6 +155,10 @@ pub struct FileDropContext {
     pub paths: Option<ExternalPaths>,
     /// Shift state captured from the native Drop callback, never synthesized by GPUI.
     pub shift_pressed: bool,
+    /// Exact modifier snapshot captured by the native Drop callback.
+    pub modifiers: crate::Modifiers,
+    /// The native source offered DROPEFFECT_LINK for this submission.
+    pub link_allowed: bool,
     /// Present only for a foreign source that offered MOVE and supports async transfer.
     pub transfer_lease: Option<FileDropTransferLease>,
     /// Handle for synchronously selecting the effect returned by the platform.
