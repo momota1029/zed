@@ -1649,10 +1649,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             shift: grfkeystate.0 & MK_SHIFT.0 != 0,
             ..Default::default()
         };
-        let shift_pressed = modifiers.shift;
-        let transfer_lease = if shift_pressed
-            && !modifiers.alt
-            && !(modifiers.control && modifiers.shift)
+        let transfer_lease = if !modifiers.alt && !modifiers.control
             && entered_session.is_none()
             && allowed_effects.0 & DROPEFFECT_MOVE.0 != 0
             // We must return Copy or None after target-side Move so the

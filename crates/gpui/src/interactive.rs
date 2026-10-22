@@ -159,7 +159,8 @@ pub struct FileDropContext {
     pub modifiers: crate::Modifiers,
     /// The native source offered DROPEFFECT_LINK for this submission.
     pub link_allowed: bool,
-    /// Present only for a foreign source that offered MOVE and supports async transfer.
+    /// Present for a foreign source that offered COPY and MOVE and supports async
+    /// transfer when modifiers request Move or leave the default operation unresolved.
     pub transfer_lease: Option<FileDropTransferLease>,
     /// Handle for synchronously selecting the effect returned by the platform.
     pub response: FileDropResponse,
